@@ -4,7 +4,11 @@ A MySQL-Driver for Go's [database/sql](http://golang.org/pkg/database/sql) packa
 
 ![Go-MySQL-Driver logo](https://raw.github.com/wiki/Go-SQL-Driver/MySQL/go-mysql-driver_m.jpg "Golang Gopher transporting the MySQL Dolphin in a wheelbarrow")
 
-**Current Version:** October 30, 2012 *(beta release)*
+**Current tagged Release:** January 08, 2013 *(beta)*
+
+[![Build Status](https://travis-ci.org/Go-SQL-Driver/MySQL.png?branch=master)](https://travis-ci.org/Go-SQL-Driver/MySQL) *(master branch)*
+
+Note: `go get` doesn't install the master branch, but the tag `go1`, which is always checked before tagging!
 
 ---------------------------------------
   * [Features](#features)
@@ -33,10 +37,11 @@ A MySQL-Driver for Go's [database/sql](http://golang.org/pkg/database/sql) packa
 ---------------------------------------
 
 ## Installation
+Simple install the package with the go tool from shell:
 ```bash
 $ go get github.com/Go-SQL-Driver/MySQL
 ```
-Make sure [Git is installed](http://git-scm.com/downloads) on your machine.
+Make sure [Git is installed](http://git-scm.com/downloads) on your machine and in your system's `PATH`.
 
 ## Usage
 _Go MySQL Driver_ is an implementation of Go's `database/sql/driver` interface, so all you need to do is import the driver and open a new Database-Connection with the given driver.
@@ -64,13 +69,18 @@ A DSN in its fullest form:
 username:password@protocol(address)/dbname?param=value
 ```
 
-Except the databasename all values are optional, so the shortest possible DSN is:
+Except of the databasename, all values are optional. So the minimal DSN is:
 ```
 /dbname
 ```
 
+If you do not want to preselect a database, leave `dbname` empty:
+```
+/
+```
+
 ### Password
-Passwords may consist of any char. No escaping necessary.
+Passwords can consist of any character. Escaping is not necessary.
 
 ### Protocol
 See [net.Dial](http://golang.org/pkg/net/#Dial) for more information which networks are available.
@@ -107,11 +117,16 @@ user:password@tcp(localhost:5555)/dbname?charset=utf8
 ```
 
 ```
-user:password@/dbname
+user:password@tcp([de:ad:be:ef::ca:fe]:80)/dbname
 ```
 
 ```
-user:password@tcp([de:ad:be:ef::ca:fe]:80)/dbname
+user:password@/dbname
+```
+
+No Database preselected:
+```
+user:password@/
 ```
 
 ---------------------------------------
