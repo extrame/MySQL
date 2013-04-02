@@ -2,7 +2,7 @@
 //
 // Copyright 2012 Julien Schmidt. All rights reserved.
 // http://www.julienschmidt.com
-// 
+//
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -10,10 +10,13 @@
 package mysql
 
 import (
+	"bytes"
 	"database/sql/driver"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"reflect"
+	"io"
+	"math"
 	"time"
 )
 
@@ -21,307 +24,320 @@ import (
 // http://dev.mysql.com/doc/internals/en/client-server-protocol.html
 
 // Read packet to buffer 'data'
-func (mc *mysqlConn) readPacket() ([]byte, error) {
-	// Packet Length
-	pktLen, e := mc.readNumber(3)
-	if e != nil {
-		return nil, e
+func (mc *mysqlConn) readPacket() (data []byte, err error) {
+	// Read packet header
+	data = make([]byte, 4)
+	err = mc.buf.read(data)
+	if err != nil {
+		errLog.Print(err.Error())
+		return nil, driver.ErrBadConn
 	}
 
-	if int(pktLen) == 0 {
-		return nil, e
+	// Packet Length [24 bit]
+	pktLen := uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16
+
+	if pktLen < 1 {
+		errLog.Print(errMalformPkt.Error())
+		return nil, driver.ErrBadConn
 	}
 
-	// Packet Number
-	pktSeq, e := mc.readNumber(1)
-	if e != nil {
-		return nil, e
-	}
-
-	// Check Packet Sync
-	if uint8(pktSeq) != mc.sequence {
-		e = errors.New("Commands out of sync; you can't run this command now")
-		return nil, e
+	// Check Packet Sync [8 bit]
+	if data[3] != mc.sequence {
+		if data[3] > mc.sequence {
+			return nil, errPktSyncMul
+		} else {
+			return nil, errPktSync
+		}
 	}
 	mc.sequence++
 
-	// Read rest of packet
-	data := make([]byte, pktLen)
-	var n, add int
-	for e == nil && n < int(pktLen) {
-		add, e = mc.bufReader.Read(data[n:])
-		n += add
-	}
-	if e != nil || n < int(pktLen) {
-		if e == nil {
-			e = fmt.Errorf("Length of read data (%d) does not match body length (%d)", n, pktLen)
+	// Read packet body [pktLen bytes]
+	data = make([]byte, pktLen)
+	err = mc.buf.read(data)
+	if err == nil {
+		if pktLen < maxPacketSize {
+			return data, nil
 		}
-		errLog.Print(`packets:58 `, e)
-		return nil, driver.ErrBadConn
+
+		// More data
+		var data2 []byte
+		data2, err = mc.readPacket()
+		if err == nil {
+			return append(data, data2...), nil
+		}
 	}
-	return data, e
+	errLog.Print(err.Error())
+	return nil, driver.ErrBadConn
 }
 
-// Read n bytes long number num
-func (mc *mysqlConn) readNumber(nr uint8) (uint64, error) {
-	// Read bytes into array
-	buf := make([]byte, nr)
-	var n, add int
-	var e error
-	for e == nil && n < int(nr) {
-		add, e = mc.bufReader.Read(buf[n:])
-		n += add
-	}
-	if e != nil || n < int(nr) {
-		if e == nil {
-			e = fmt.Errorf("Length of read data (%d) does not match header length (%d)", n, nr)
+// Write packet buffer 'data'
+// The packet header must be already included
+func (mc *mysqlConn) writePacket(data []byte) error {
+	if len(data)-4 <= mc.maxWriteSize { // Can send data at once
+		// Write packet
+		n, err := mc.netConn.Write(data)
+		if err == nil && n == len(data) {
+			mc.sequence++
+			return nil
 		}
-		errLog.Print(`packets:78 `, e)
-		return 0, driver.ErrBadConn
-	}
 
-	// Convert to uint64
-	var num uint64 = 0
-	for i := uint8(0); i < nr; i++ {
-		num |= uint64(buf[i]) << (i * 8)
-	}
-	return num, e
-}
-
-func (mc *mysqlConn) writePacket(data *[]byte) error {
-	// Set time BEFORE to avoid possible collisions
-	if mc.server.keepalive > 0 {
-		mc.lastCmdTime = time.Now()
-	}
-
-	// Write packet
-	n, e := mc.netConn.Write(*data)
-	if e != nil || n != len(*data) {
-		if e == nil {
-			e = errors.New("Length of send data does not match packet length")
+		// Handle error
+		if err == nil { // n != len(data)
+			errLog.Print(errMalformPkt.Error())
+		} else {
+			errLog.Print(err.Error())
 		}
-		errLog.Print(`packets:102 `, e)
 		return driver.ErrBadConn
 	}
 
-	mc.sequence++
-	return nil
+	// Must split packet
+	return mc.splitPacket(data)
+}
+
+func (mc *mysqlConn) splitPacket(data []byte) (err error) {
+	pktLen := len(data) - 4
+
+	if pktLen > mc.maxPacketAllowed {
+		return errPktTooLarge
+	}
+
+	for pktLen >= maxPacketSize {
+		data[0] = 0xff
+		data[1] = 0xff
+		data[2] = 0xff
+		data[3] = mc.sequence
+
+		// Write packet
+		n, err := mc.netConn.Write(data[:4+maxPacketSize])
+		if err == nil && n == 4+maxPacketSize {
+			mc.sequence++
+			data = data[maxPacketSize:]
+			pktLen -= maxPacketSize
+			continue
+		}
+
+		// Handle error
+		if err == nil { // n != len(data)
+			errLog.Print(errMalformPkt.Error())
+		} else {
+			errLog.Print(err.Error())
+		}
+		return driver.ErrBadConn
+	}
+
+	data[0] = byte(pktLen)
+	data[1] = byte(pktLen >> 8)
+	data[2] = byte(pktLen >> 16)
+	data[3] = mc.sequence
+	return mc.writePacket(data)
 }
 
 /******************************************************************************
 *                           Initialisation Process                            *
 ******************************************************************************/
 
-/* Handshake Initialization Packet 
- Bytes                        Name
- -----                        ----
- 1                            protocol_version
- n (Null-Terminated String)   server_version
- 4                            thread_id
- 8                            scramble_buff
- 1                            (filler) always 0x00
- 2                            server_capabilities
- 1                            server_language
- 2                            server_status
- 2                            server capabilities (two upper bytes)
- 1                            length of the scramble
-10                            (filler)  always 0
- n                            rest of the plugin provided data (at least 12 bytes) 
- 1                            \0 byte, terminating the second part of a scramble
-*/
-func (mc *mysqlConn) readInitPacket() (e error) {
-	data, e := mc.readPacket()
-	if e != nil {
-		return
-	}
-
-	mc.server = new(serverSettings)
-
-	// Position
-	pos := 0
-
-	// Protocol version [8 bit uint]
-	mc.server.protocol = data[pos]
-	if mc.server.protocol < MIN_PROTOCOL_VERSION {
-		e = fmt.Errorf(
-			"Unsupported MySQL Protocol Version %d. Protocol Version %d or higher is required",
-			mc.server.protocol,
-			MIN_PROTOCOL_VERSION)
-	}
-	pos++
-
-	// Server version [null terminated string]
-	slice, err := readSlice(data[pos:], 0x00)
+// Handshake Initialization Packet
+// http://dev.mysql.com/doc/internals/en/connection-phase.html#packet-Protocol::Handshake
+func (mc *mysqlConn) readInitPacket() (err error) {
+	data, err := mc.readPacket()
 	if err != nil {
 		return
 	}
-	mc.server.version = string(slice)
-	pos += len(slice) + 1
 
-	// Thread id [32 bit uint]
-	mc.server.threadID = bytesToUint32(data[pos : pos+4])
-	pos += 4
+	if data[0] == iERR {
+		return mc.handleErrorPacket(data)
+	}
 
-	// First part of scramble buffer [8 bytes]
-	mc.server.scrambleBuff = make([]byte, 8)
-	mc.server.scrambleBuff = data[pos : pos+8]
-	pos += 9
+	// protocol version [1 byte]
+	if data[0] < minProtocolVersion {
+		err = fmt.Errorf(
+			"Unsupported MySQL Protocol Version %d. Protocol Version %d or higher is required",
+			data[0],
+			minProtocolVersion)
+	}
 
-	// Server capabilities [16 bit uint]
-	mc.server.flags = ClientFlag(bytesToUint16(data[pos : pos+2]))
-	if mc.server.flags&CLIENT_PROTOCOL_41 == 0 {
-		e = errors.New("MySQL-Server does not support required Protocol 41+")
+	// server version [null terminated string]
+	// connection id [4 bytes]
+	pos := 1 + bytes.IndexByte(data[1:], 0x00) + 1 + 4
+
+	// first part of the password cipher [8 bytes]
+	mc.cipher = append(mc.cipher, data[pos:pos+8]...)
+
+	// (filler) always 0x00 [1 byte]
+	pos += 8 + 1
+
+	// capability flags (lower 2 bytes) [2 bytes]
+	mc.flags = clientFlag(binary.LittleEndian.Uint16(data[pos : pos+2]))
+	if mc.flags&clientProtocol41 == 0 {
+		err = errors.New("MySQL-Server does not support required Protocol 41+")
 	}
 	pos += 2
 
-	// Server language [8 bit uint]
-	mc.server.charset = data[pos]
-	pos++
+	if len(data) > pos {
+		// character set [1 byte]
+		mc.charset = data[pos]
 
-	// Server status [16 bit uint]
-	pos += 15
+		// status flags [2 bytes]
+		// capability flags (upper 2 bytes) [2 bytes]
+		// length of auth-plugin-data [1 byte]
+		// reserved (all [00]) [10 bytes]
+		pos += 1 + 2 + 2 + 1 + 10
 
-	mc.server.scrambleBuff = append(mc.server.scrambleBuff, data[pos:pos+12]...)
+		// second part of the password cipher [12? bytes]
+		// The documentation is ambiguous about the length.
+		// The official Python library uses the fixed length 12
+		// which is not documented but seems to work.
+		mc.cipher = append(mc.cipher, data[pos:pos+12]...)
+
+		if data[len(data)-1] == 0 {
+			return
+		}
+		return errMalformPkt
+	}
 
 	return
 }
 
-/* Client Authentication Packet 
-Bytes                        Name
------                        ----
-4                            client_flags
-4                            max_packet_size
-1                            charset_number
-23                           (filler) always 0x00...
-n (Null-Terminated String)   user
-n (Length Coded Binary)      scramble_buff (1 + x bytes)
-n (Null-Terminated String)   databasename (optional)
-*/
-func (mc *mysqlConn) writeAuthPacket() (e error) {
+// Client Authentication Packet
+// http://dev.mysql.com/doc/internals/en/connection-phase.html#packet-Protocol::HandshakeResponse
+func (mc *mysqlConn) writeAuthPacket() error {
 	// Adjust client flags based on server support
-	clientFlags := uint32(CLIENT_MULTI_STATEMENTS |
-		// CLIENT_MULTI_RESULTS |
-		CLIENT_PROTOCOL_41 |
-		CLIENT_SECURE_CONN |
-		CLIENT_LONG_PASSWORD |
-		CLIENT_TRANSACTIONS)
-	if mc.server.flags&CLIENT_LONG_FLAG > 0 {
-		clientFlags |= uint32(CLIENT_LONG_FLAG)
+	clientFlags := uint32(
+		clientProtocol41 |
+			clientSecureConn |
+			clientLongPassword |
+			clientTransactions |
+			clientLocalFiles,
+	)
+	if mc.flags&clientLongFlag > 0 {
+		clientFlags |= uint32(clientLongFlag)
 	}
 
 	// User Password
-	scrambleBuff := scramblePassword(mc.server.scrambleBuff, []byte(mc.cfg.passwd))
+	scrambleBuff := scramblePassword(mc.cipher, []byte(mc.cfg.passwd))
+	mc.cipher = nil
 
 	pktLen := 4 + 4 + 1 + 23 + len(mc.cfg.user) + 1 + 1 + len(scrambleBuff)
 
 	// To specify a db name
 	if len(mc.cfg.dbname) > 0 {
-		clientFlags |= uint32(CLIENT_CONNECT_WITH_DB)
+		clientFlags |= uint32(clientConnectWithDB)
 		pktLen += len(mc.cfg.dbname) + 1
 	}
 
 	// Calculate packet length and make buffer with that size
-	data := make([]byte, 0, pktLen+4)
+	data := make([]byte, pktLen+4)
 
-	// Add the packet header
-	data = append(data, uint24ToBytes(uint32(pktLen))...)
-	data = append(data, mc.sequence)
+	// Add the packet header  [24bit length + 1 byte sequence]
+	data[0] = byte(pktLen)
+	data[1] = byte(pktLen >> 8)
+	data[2] = byte(pktLen >> 16)
+	data[3] = mc.sequence
 
-	// ClientFlags
-	data = append(data, uint32ToBytes(clientFlags)...)
+	// ClientFlags [32 bit]
+	data[4] = byte(clientFlags)
+	data[5] = byte(clientFlags >> 8)
+	data[6] = byte(clientFlags >> 16)
+	data[7] = byte(clientFlags >> 24)
 
-	// MaxPacketSize
-	data = append(data, uint32ToBytes(MAX_PACKET_SIZE)...)
+	// MaxPacketSize [32 bit] (none)
+	//data[8] = 0x00
+	//data[9] = 0x00
+	//data[10] = 0x00
+	//data[11] = 0x00
 
-	// Charset
-	data = append(data, mc.server.charset)
+	// Charset [1 byte]
+	data[12] = mc.charset
 
-	// Filler
-	data = append(data, make([]byte, 23)...)
+	// Filler [23 bytes] (all 0x00)
+	pos := 13 + 23
 
-	// User
+	// User [null terminated string]
 	if len(mc.cfg.user) > 0 {
-		data = append(data, []byte(mc.cfg.user)...)
+		pos += copy(data[pos:], mc.cfg.user)
 	}
+	//data[pos] = 0x00
+	pos++
 
-	// Null-Terminator
-	data = append(data, 0x0)
+	// ScrambleBuffer [length encoded integer]
+	data[pos] = byte(len(scrambleBuff))
+	pos += 1 + copy(data[pos+1:], scrambleBuff)
 
-	// ScrambleBuffer
-	data = append(data, byte(len(scrambleBuff)))
-	if len(scrambleBuff) > 0 {
-		data = append(data, scrambleBuff...)
-	}
-
-	// Databasename
+	// Databasename [null terminated string]
 	if len(mc.cfg.dbname) > 0 {
-		data = append(data, []byte(mc.cfg.dbname)...)
-		// Null-Terminator
-		data = append(data, 0x0)
+		pos += copy(data[pos:], mc.cfg.dbname)
+		//data[pos] = 0x00
 	}
 
 	// Send Auth packet
-	return mc.writePacket(&data)
+	return mc.writePacket(data)
 }
 
 /******************************************************************************
 *                             Command Packets                                 *
 ******************************************************************************/
 
-/* Command Packet
-Bytes                        Name
------                        ----
-1                            command
-n                            arg
-*/
-func (mc *mysqlConn) writeCommandPacket(command commandType, args ...interface{}) (e error) {
+func (mc *mysqlConn) writeCommandPacket(command byte) error {
 	// Reset Packet Sequence
 	mc.sequence = 0
 
-	var arg []byte
+	// Send CMD packet
+	return mc.writePacket([]byte{
+		// Add the packet header [24bit length + 1 byte sequence]
+		0x05, // 5 bytes long
+		0x00,
+		0x00,
+		0x00, // mc.sequence
 
-	switch command {
+		// Add command byte
+		command,
+	})
+}
 
-	// Commands without args
-	case COM_QUIT, COM_PING:
-		if len(args) > 0 {
-			return fmt.Errorf("Too much arguments (Got: %d Has: 0)", len(args))
-		}
-		arg = []byte{}
-
-	// Commands with 1 arg unterminated string
-	case COM_QUERY, COM_STMT_PREPARE:
-		if len(args) != 1 {
-			return fmt.Errorf("Invalid arguments count (Got: %d Has: 1)", len(args))
-		}
-		arg = []byte(args[0].(string))
-
-	// Commands with 1 arg 32 bit uint
-	case COM_STMT_CLOSE:
-		if len(args) != 1 {
-			return fmt.Errorf("Invalid arguments count (Got: %d Has: 1)", len(args))
-		}
-		arg = uint32ToBytes(args[0].(uint32))
-
-	default:
-		return fmt.Errorf("Unknown command: %d", command)
-	}
+func (mc *mysqlConn) writeCommandPacketStr(command byte, arg string) error {
+	// Reset Packet Sequence
+	mc.sequence = 0
 
 	pktLen := 1 + len(arg)
-	data := make([]byte, 0, pktLen+4)
+	data := make([]byte, pktLen+4)
 
-	// Add the packet header
-	data = append(data, uint24ToBytes(uint32(pktLen))...)
-	data = append(data, mc.sequence)
+	// Add the packet header [24bit length + 1 byte sequence]
+	data[0] = byte(pktLen)
+	data[1] = byte(pktLen >> 8)
+	data[2] = byte(pktLen >> 16)
+	//data[3] = mc.sequence
 
 	// Add command byte
-	data = append(data, byte(command))
+	data[4] = command
 
 	// Add arg
-	data = append(data, arg...)
+	copy(data[5:], arg)
 
 	// Send CMD packet
-	return mc.writePacket(&data)
+	return mc.writePacket(data)
+}
+
+func (mc *mysqlConn) writeCommandPacketUint32(command byte, arg uint32) error {
+	// Reset Packet Sequence
+	mc.sequence = 0
+
+	// Send CMD packet
+	return mc.writePacket([]byte{
+		// Add the packet header [24bit length + 1 byte sequence]
+		0x05, // 5 bytes long
+		0x00,
+		0x00,
+		0x00, // mc.sequence
+
+		// Add command byte
+		command,
+
+		// Add arg [32 bit]
+		byte(arg),
+		byte(arg >> 8),
+		byte(arg >> 16),
+		byte(arg >> 24),
+	})
 }
 
 /******************************************************************************
@@ -329,302 +345,236 @@ func (mc *mysqlConn) writeCommandPacket(command commandType, args ...interface{}
 ******************************************************************************/
 
 // Returns error if Packet is not an 'Result OK'-Packet
-func (mc *mysqlConn) readResultOK() (e error) {
-	data, e := mc.readPacket()
-	if e != nil {
-		return
-	}
+func (mc *mysqlConn) readResultOK() error {
+	data, err := mc.readPacket()
+	if err == nil {
+		// packet indicator
+		switch data[0] {
 
-	switch data[0] {
-	// OK
-	case 0:
-		return mc.handleOkPacket(data)
-	// EOF, someone is using old_passwords
-	case 254:
-		e = errors.New("It seems like you are using old_passwords, which is unsupported. See https://github.com/Go-SQL-Driver/MySQL/wiki/old_passwords")
-		return
-	// ERROR
-	case 255:
-		return mc.handleErrorPacket(data)
-	default:
-		e = errors.New("Invalid Result Packet-Type")
-		return
-	}
+		case iOK:
+			mc.handleOkPacket(data)
+			return nil
 
-	return
+		case iEOF: // someone is using old_passwords
+			return errOldPassword
+
+		default: // Error otherwise
+			return mc.handleErrorPacket(data)
+		}
+	}
+	return err
 }
 
-/* Error Packet 
-Bytes                       Name
------                       ----
-1                           field_count, always = 0xff
-2                           errno
-1                           (sqlstate marker), always '#'
-5                           sqlstate (5 characters)
-n                           message
-*/
-func (mc *mysqlConn) handleErrorPacket(data []byte) (e error) {
-	if data[0] != 255 {
-		e = errors.New("Wrong Packet-Type: Not an Error-Packet")
-		return
+// Result Set Header Packet
+// http://dev.mysql.com/doc/internals/en/text-protocol.html#packet-ProtocolText::Resultset
+func (mc *mysqlConn) readResultSetHeaderPacket() (int, error) {
+	data, err := mc.readPacket()
+	if err == nil {
+		switch data[0] {
+
+		case iOK:
+			mc.handleOkPacket(data)
+			return 0, nil
+
+		case iERR:
+			return 0, mc.handleErrorPacket(data)
+
+		case iLocalInFile:
+			return 0, mc.handleInFileRequest(string(data[1:]))
+		}
+
+		// column count
+		num, _, n := readLengthEncodedInteger(data)
+		if n-len(data) == 0 {
+			return int(num), nil
+		}
+
+		return 0, errMalformPkt
+	}
+	return 0, err
+}
+
+// Error Packet
+// http://dev.mysql.com/doc/internals/en/overview.html#packet-ERR_Packet
+func (mc *mysqlConn) handleErrorPacket(data []byte) error {
+	if data[0] != iERR {
+		return errMalformPkt
 	}
 
-	pos := 1
+	// 0xff [1 byte]
 
 	// Error Number [16 bit uint]
-	errno := bytesToUint16(data[pos : pos+2])
-	pos += 2
+	errno := binary.LittleEndian.Uint16(data[1:3])
 
-	// SQL State [# + 5bytes string]
+	pos := 3
+
+	// SQL State [optional: # + 5bytes string]
 	//sqlstate := string(data[pos : pos+6])
-	pos += 6
+	if data[pos] == 0x23 {
+		pos = 9
+	}
 
 	// Error Message [string]
-	message := string(data[pos:])
-
-	e = fmt.Errorf("Error %d: %s", errno, message)
-	return
+	return fmt.Errorf("Error %d: %s", errno, string(data[pos:]))
 }
 
-/* Ok Packet 
-Bytes                       Name
------                       ----
-1   (Length Coded Binary)   field_count, always = 0
-1-9 (Length Coded Binary)   affected_rows
-1-9 (Length Coded Binary)   insert_id
-2                           server_status
-2                           warning_count
-n   (until end of packet)   message
-*/
-func (mc *mysqlConn) handleOkPacket(data []byte) (e error) {
-	if data[0] != 0 {
-		e = errors.New("Wrong Packet-Type: Not an OK-Packet")
-		return
-	}
+// Ok Packet
+// http://dev.mysql.com/doc/internals/en/overview.html#packet-OK_Packet
+func (mc *mysqlConn) handleOkPacket(data []byte) {
+	var n int
 
-	// Position
-	pos := 1
+	// 0x00 [1 byte]
 
 	// Affected rows [Length Coded Binary]
-	affectedRows, n, e := bytesToLengthCodedBinary(data[pos:])
-	if e != nil {
-		return
-	}
-	pos += n
+	mc.affectedRows, _, n = readLengthEncodedInteger(data[1:])
 
 	// Insert id [Length Coded Binary]
-	insertID, n, e := bytesToLengthCodedBinary(data[pos:])
-	if e != nil {
-		return
-	}
+	mc.insertId, _, _ = readLengthEncodedInteger(data[1+n:])
 
-	// Skip remaining data
-
-	mc.affectedRows = affectedRows
-	mc.insertId = insertID
-
-	return
-}
-
-/* Result Set Header Packet 
- Bytes                        Name
- -----                        ----
- 1-9   (Length-Coded-Binary)  field_count
- 1-9   (Length-Coded-Binary)  extra
-
-The order of packets for a result set is: 
-  (Result Set Header Packet)  the number of columns
-  (Field Packets)             column descriptors
-  (EOF Packet)                marker: end of Field Packets
-  (Row Data Packets)          row contents
-  (EOF Packet)                marker: end of Data Packets
-*/
-func (mc *mysqlConn) readResultSetHeaderPacket() (fieldCount int, e error) {
-	data, e := mc.readPacket()
-	if e != nil {
-		errLog.Print(`packets:437 `, e)
-		e = driver.ErrBadConn
-		return
-	}
-
-	if data[0] == 255 {
-		e = mc.handleErrorPacket(data)
-		return
-	} else if data[0] == 0 {
-		e = mc.handleOkPacket(data)
-		return
-	}
-
-	num, n, e := bytesToLengthCodedBinary(data)
-	if e != nil || (n-len(data)) != 0 {
-		e = errors.New("Malformed Packet")
-		return
-	}
-
-	fieldCount = int(num)
-	return
+	// server_status [2 bytes]
+	// warning count [2 bytes]
+	// message [until end of packet]
 }
 
 // Read Packets as Field Packets until EOF-Packet or an Error appears
-func (mc *mysqlConn) readColumns(n int) (columns []mysqlField, e error) {
+// http://dev.mysql.com/doc/internals/en/text-protocol.html#packet-Protocol::ColumnDefinition41
+func (mc *mysqlConn) readColumns(count int) (columns []mysqlField, err error) {
 	var data []byte
+	var i, pos, n int
+	var name []byte
+
+	columns = make([]mysqlField, count)
 
 	for {
-		data, e = mc.readPacket()
-		if e != nil {
+		data, err = mc.readPacket()
+		if err != nil {
 			return
 		}
 
 		// EOF Packet
-		if data[0] == 254 && len(data) == 5 {
-			if len(columns) != n {
-				e = fmt.Errorf("ColumnsCount mismatch n:%d len:%d", n, len(columns))
+		if data[0] == iEOF && len(data) == 5 {
+			if i != count {
+				err = fmt.Errorf("ColumnsCount mismatch n:%d len:%d", count, len(columns))
 			}
 			return
 		}
 
-		var pos, n int
-		var name []byte
-		//var catalog, database, table, orgTable, name, orgName []byte
-		//var defaultVal uint64
-
 		// Catalog
-		//catalog, n, _, e = readLengthCodedBinary(data)
-		n, e = readAndDropLengthCodedBinary(data)
-		if e != nil {
+		pos, err = skipLengthEnodedString(data)
+		if err != nil {
 			return
 		}
-		pos += n
 
 		// Database [len coded string]
-		//database, n, _, e = readLengthCodedBinary(data[pos:])
-		n, e = readAndDropLengthCodedBinary(data[pos:])
-		if e != nil {
+		n, err = skipLengthEnodedString(data[pos:])
+		if err != nil {
 			return
 		}
 		pos += n
 
 		// Table [len coded string]
-		//table, n, _, e = readLengthCodedBinary(data[pos:])
-		n, e = readAndDropLengthCodedBinary(data[pos:])
-		if e != nil {
+		n, err = skipLengthEnodedString(data[pos:])
+		if err != nil {
 			return
 		}
 		pos += n
 
 		// Original table [len coded string]
-		//orgTable, n, _, e = readLengthCodedBinary(data[pos:])
-		n, e = readAndDropLengthCodedBinary(data[pos:])
-		if e != nil {
+		n, err = skipLengthEnodedString(data[pos:])
+		if err != nil {
 			return
 		}
 		pos += n
 
 		// Name [len coded string]
-		name, n, _, e = readLengthCodedBinary(data[pos:])
-		if e != nil {
+		name, _, n, err = readLengthEnodedString(data[pos:])
+		if err != nil {
 			return
 		}
+		columns[i].name = string(name)
 		pos += n
 
 		// Original name [len coded string]
-		//orgName, n, _, e = readLengthCodedBinary(data[pos:])
-		n, e = readAndDropLengthCodedBinary(data[pos:])
-		if e != nil {
+		n, err = skipLengthEnodedString(data[pos:])
+		if err != nil {
 			return
 		}
-		pos += n
 
-		// Filler
-		pos++
-
+		// Filler [1 byte]
 		// Charset [16 bit uint]
-		//charsetNumber := bytesToUint16(data[pos : pos+2])
-		pos += 2
-
 		// Length [32 bit uint]
-		//length := bytesToUint32(data[pos : pos+4])
-		pos += 4
+		pos += n + 1 + 2 + 4
 
 		// Field type [byte]
-		fieldType := FieldType(data[pos])
+		columns[i].fieldType = data[pos]
 		pos++
 
 		// Flags [16 bit uint]
-		flags := FieldFlag(bytesToUint16(data[pos : pos+2]))
+		columns[i].flags = fieldFlag(binary.LittleEndian.Uint16(data[pos : pos+2]))
 		//pos += 2
 
 		// Decimals [8 bit uint]
-		//decimals := data[pos]
 		//pos++
 
 		// Default value [len coded binary]
 		//if pos < len(data) {
-		//	defaultVal, _, e = bytesToLengthCodedBinary(data[pos:])
+		//	defaultVal, _, err = bytesToLengthCodedBinary(data[pos:])
 		//}
 
-		columns = append(columns, mysqlField{name: string(name), fieldType: fieldType, flags: flags})
+		i++
 	}
 
 	return
 }
 
 // Read Packets as Field Packets until EOF-Packet or an Error appears
-func (mc *mysqlConn) readRows(columnsCount int) (rows []*[][]byte, e error) {
-	var data []byte
-	var i, pos, n int
-	var isNull bool
-
-	for {
-		data, e = mc.readPacket()
-		if e != nil {
-			return
-		}
-
-		// EOF Packet
-		if data[0] == 254 && len(data) == 5 {
-			return
-		}
-
-		// RowSet Packet
-		row := make([][]byte, columnsCount)
-		pos = 0
-		for i = 0; i < columnsCount; i++ {
-			// Read bytes and convert to string
-			row[i], n, isNull, e = readLengthCodedBinary(data[pos:])
-			if e != nil {
-				return
-			}
-
-			// Append nil if field is NULL
-			if isNull {
-				row[i] = nil
-			}
-			pos += n
-		}
-		rows = append(rows, &row)
+// http://dev.mysql.com/doc/internals/en/text-protocol.html#packet-ProtocolText::ResultsetRow
+func (rows *mysqlRows) readRow(dest []driver.Value) (err error) {
+	data, err := rows.mc.readPacket()
+	if err != nil {
+		return
 	}
 
-	mc.affectedRows = uint64(len(rows))
+	// EOF Packet
+	if data[0] == iEOF && len(data) == 5 {
+		return io.EOF
+	}
+
+	// RowSet Packet
+	var n int
+	var isNull bool
+	pos := 0
+
+	for i := range dest {
+		// Read bytes and convert to string
+		dest[i], isNull, n, err = readLengthEnodedString(data[pos:])
+		pos += n
+		if err == nil {
+			if !isNull {
+				continue
+			} else {
+				dest[i] = nil
+				continue
+			}
+		}
+		return // err
+	}
+
 	return
 }
 
-// Reads Packets Packets until EOF-Packet or an Error appears. Returns count of Packets read
-func (mc *mysqlConn) readUntilEOF() (count uint64, e error) {
+// Reads Packets until EOF-Packet or an Error appears. Returns count of Packets read
+func (mc *mysqlConn) readUntilEOF() (err error) {
 	var data []byte
 
 	for {
-		data, e = mc.readPacket()
-		if e != nil {
-			return
-		}
+		data, err = mc.readPacket()
 
-		// EOF Packet
-		if data[0] == 254 && len(data) == 5 {
-			return
+		// No Err and no EOF Packet
+		if err == nil && (data[0] != iEOF || len(data) != 5) {
+			continue
 		}
-
-		count++
+		return // Err or EOF
 	}
 	return
 }
@@ -633,397 +583,485 @@ func (mc *mysqlConn) readUntilEOF() (count uint64, e error) {
 *                           Prepared Statements                               *
 ******************************************************************************/
 
-/* Prepare Result Packets 
- Type Of Result Packet       Hexadecimal Value Of First Byte (field_count)
- ---------------------       ---------------------------------------------
+// Prepare Result Packets
+// http://dev.mysql.com/doc/internals/en/prepared-statements.html#com-stmt-prepare-response
+func (stmt *mysqlStmt) readPrepareResultPacket() (columnCount uint16, err error) {
+	data, err := stmt.mc.readPacket()
+	if err == nil {
+		// Position
+		pos := 0
 
- Prepare OK Packet           00
- Error Packet                ff
+		// packet indicator [1 byte]
+		if data[pos] != iOK {
+			err = stmt.mc.handleErrorPacket(data)
+			return
+		}
+		pos++
 
-Prepare OK Packet 
- Bytes              Name
- -----              ----
- 1                  0 - marker for OK packet
- 4                  statement_handler_id
- 2                  number of columns in result set
- 2                  number of parameters in query
- 1                  filler (always 0)
- 2                  warning count
+		// statement id [4 bytes]
+		stmt.id = binary.LittleEndian.Uint32(data[pos : pos+4])
+		pos += 4
 
- It is made up of:
+		// Column count [16 bit uint]
+		columnCount = binary.LittleEndian.Uint16(data[pos : pos+2])
+		pos += 2
 
-    a PREPARE_OK packet
-    if "number of parameters" > 0
-        (field packets) as in a Result Set Header Packet
-        (EOF packet) 
-    if "number of columns" > 0
-        (field packets) as in a Result Set Header Packet
-        (EOF packet) 
+		// Param count [16 bit uint]
+		stmt.paramCount = int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+		pos += 2
 
-*/
-func (stmt mysqlStmt) readPrepareResultPacket() (columnCount uint16, e error) {
-	data, e := stmt.mc.readPacket()
-	if e != nil {
-		return
+		// Warning count [16 bit uint]
+		// bytesToUint16(data[pos : pos+2])
 	}
-
-	// Position
-	pos := 0
-
-	if data[pos] != 0 {
-		e = stmt.mc.handleErrorPacket(data)
-		return
-	}
-	pos++
-
-	stmt.id = bytesToUint32(data[pos : pos+4])
-	pos += 4
-
-	// Column count [16 bit uint]
-	columnCount = bytesToUint16(data[pos : pos+2])
-	pos += 2
-
-	// Param count [16 bit uint]
-	stmt.paramCount = int(bytesToUint16(data[pos : pos+2]))
-	pos += 2
-
-	// Warning count [16 bit uint]
-	// bytesToUint16(data[pos : pos+2])
-
 	return
 }
 
-/* Command Packet
-Bytes                Name
------                ----
-1                    code
-4                    statement_id
-1                    flags
-4                    iteration_count
-  if param_count > 0:
-(param_count+7)/8    null_bit_map
-1                    new_parameter_bound_flag
-  if new_params_bound == 1:
-n*2                  type of parameters
-n                    values for the parameters 
-*/
-func (stmt mysqlStmt) buildExecutePacket(args *[]driver.Value) (e error) {
-	argsLen := len(*args)
-	if argsLen < stmt.paramCount {
+// http://dev.mysql.com/doc/internals/en/prepared-statements.html#com-stmt-send-long-data
+func (stmt *mysqlStmt) writeCommandLongData(paramID int, arg []byte) (err error) {
+	maxLen := stmt.mc.maxPacketAllowed - 1
+	pktLen := maxLen
+	argLen := len(arg)
+	data := make([]byte, 4+1+4+2+argLen)
+	copy(data[4+1+4+2:], arg)
+
+	for argLen > 0 {
+		if 1+4+2+argLen < maxLen {
+			pktLen = 1 + 4 + 2 + argLen
+		}
+
+		// Add the packet header [24bit length + 1 byte sequence]
+		data[0] = byte(pktLen)
+		data[1] = byte(pktLen >> 8)
+		data[2] = byte(pktLen >> 16)
+		data[3] = 0x00 // mc.sequence
+
+		// Add command byte [1 byte]
+		data[4] = comStmtSendLongData
+
+		// Add stmtID [32 bit]
+		data[5] = byte(stmt.id)
+		data[6] = byte(stmt.id >> 8)
+		data[7] = byte(stmt.id >> 16)
+		data[8] = byte(stmt.id >> 24)
+
+		// Add paramID [16 bit]
+		data[9] = byte(paramID)
+		data[10] = byte(paramID >> 8)
+
+		// Send CMD packet
+		err = stmt.mc.writePacket(data[:4+pktLen])
+		if err == nil {
+			argLen -= pktLen - (1 + 4 + 2)
+			data = data[pktLen-(1+4+2):]
+			continue
+		}
+		return err
+
+	}
+
+	// Reset Packet Sequence
+	stmt.mc.sequence = 0
+	return nil
+}
+
+// Execute Prepared Statement
+// http://dev.mysql.com/doc/internals/en/prepared-statements.html#com-stmt-execute
+func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
+	if len(args) != stmt.paramCount {
 		return fmt.Errorf(
-			"Not enough Arguments to call STMT_EXEC (Got: %d Has: %d",
-			argsLen,
+			"Arguments count mismatch (Got: %d Has: %d",
+			len(args),
 			stmt.paramCount)
 	}
 
 	// Reset packet-sequence
 	stmt.mc.sequence = 0
 
-	pktLen := 1 + 4 + 1 + 4 + (stmt.paramCount+7)/8 + 1 + argsLen*2
-	paramValues := make([][]byte, 0, argsLen)
-	paramTypes := make([]byte, 0, argsLen*2)
+	pktLen := 1 + 4 + 1 + 4 + ((stmt.paramCount + 7) >> 3) + 1 + (stmt.paramCount << 1)
+	paramValues := make([][]byte, stmt.paramCount)
+	paramTypes := make([]byte, (stmt.paramCount << 1))
 	bitMask := uint64(0)
-	var i, valLen int
-	var pv reflect.Value
-	for i = 0; i < stmt.paramCount; i++ {
-		// build nullBitMap	
-		if (*args)[i] == nil {
+	var i int
+
+	for i = range args {
+		// build NULL-bitmap
+		if args[i] == nil {
 			bitMask += 1 << uint(i)
+			paramTypes[i<<1] = fieldTypeNULL
+			continue
 		}
 
 		// cache types and values
-		switch (*args)[i].(type) {
-		case nil:
-			paramTypes = append(paramTypes, []byte{
-				byte(FIELD_TYPE_NULL),
-				0x0}...)
+		switch v := args[i].(type) {
+		case int64:
+			paramTypes[i<<1] = fieldTypeLongLong
+			paramValues[i] = uint64ToBytes(uint64(v))
+			pktLen += 8
+			continue
+
+		case float64:
+			paramTypes[i<<1] = fieldTypeDouble
+			paramValues[i] = uint64ToBytes(math.Float64bits(v))
+			pktLen += 8
+			continue
+
+		case bool:
+			paramTypes[i<<1] = fieldTypeTiny
+			pktLen++
+			if v {
+				paramValues[i] = []byte{0x01}
+			} else {
+				paramValues[i] = []byte{0x00}
+			}
 			continue
 
 		case []byte:
-			paramTypes = append(paramTypes, []byte{byte(FIELD_TYPE_STRING), 0x0}...)
-			val := (*args)[i].([]byte)
-			valLen = len(val)
-			lcb := lengthCodedBinaryToBytes(uint64(valLen))
-			pktLen += len(lcb) + valLen
-			paramValues = append(paramValues, lcb)
-			paramValues = append(paramValues, val)
-			continue
+			paramTypes[i<<1] = fieldTypeString
+			if len(v) < stmt.mc.maxPacketAllowed-pktLen-(stmt.paramCount-(i+1))*64 {
+				paramValues[i] = append(
+					lengthEncodedIntegerToBytes(uint64(len(v))),
+					v...,
+				)
+				pktLen += len(paramValues[i])
+				continue
+			} else {
+				err := stmt.writeCommandLongData(i, v)
+				if err == nil {
+					continue
+				}
+				return err
+			}
+
+		case string:
+			paramTypes[i<<1] = fieldTypeString
+			if len(v) < stmt.mc.maxPacketAllowed-pktLen-(stmt.paramCount-(i+1))*64 {
+				paramValues[i] = append(
+					lengthEncodedIntegerToBytes(uint64(len(v))),
+					[]byte(v)...,
+				)
+				pktLen += len(paramValues[i])
+				continue
+			} else {
+				err := stmt.writeCommandLongData(i, []byte(v))
+				if err == nil {
+					continue
+				}
+				return err
+			}
 
 		case time.Time:
-			// Format to string for time+date Fields
-			// Data is packed in case reflect.String below
-			(*args)[i] = (*args)[i].(time.Time).Format(TIME_FORMAT)
-		}
-
-		pv = reflect.ValueOf((*args)[i])
-		switch pv.Kind() {
-		case reflect.Int64:
-			paramTypes = append(paramTypes, []byte{byte(FIELD_TYPE_LONGLONG), 0x0}...)
-			val := int64ToBytes(pv.Int())
-			pktLen += len(val)
-			paramValues = append(paramValues, val)
-			continue
-
-		case reflect.Float64:
-			paramTypes = append(paramTypes, []byte{byte(FIELD_TYPE_DOUBLE), 0x0}...)
-			val := float64ToBytes(pv.Float())
-			pktLen += len(val)
-			paramValues = append(paramValues, val)
-			continue
-
-		case reflect.Bool:
-			paramTypes = append(paramTypes, []byte{byte(FIELD_TYPE_TINY), 0x0}...)
-			val := pv.Bool()
-			pktLen++
-			if val {
-				paramValues = append(paramValues, []byte{byte(1)})
-			} else {
-				paramValues = append(paramValues, []byte{byte(0)})
-			}
-			continue
-
-		case reflect.String:
-			paramTypes = append(paramTypes, []byte{byte(FIELD_TYPE_STRING), 0x0}...)
-			val := []byte(pv.String())
-			valLen = len(val)
-			lcb := lengthCodedBinaryToBytes(uint64(valLen))
-			pktLen += valLen + len(lcb)
-			paramValues = append(paramValues, lcb)
-			paramValues = append(paramValues, val)
+			paramTypes[i<<1] = fieldTypeString
+			val := []byte(v.Format(timeFormat))
+			paramValues[i] = append(
+				lengthEncodedIntegerToBytes(uint64(len(val))),
+				val...,
+			)
+			pktLen += len(paramValues[i])
 			continue
 
 		default:
-			return fmt.Errorf("Invalid Value: %s", pv.Kind().String())
+			return fmt.Errorf("Can't convert type: %T", args[i])
 		}
 	}
 
-	data := make([]byte, 0, pktLen+4)
+	data := make([]byte, pktLen+4)
 
-	// Add the packet header
-	data = append(data, uint24ToBytes(uint32(pktLen))...)
-	data = append(data, stmt.mc.sequence)
+	// packet header [4 bytes]
+	data[0] = byte(pktLen)
+	data[1] = byte(pktLen >> 8)
+	data[2] = byte(pktLen >> 16)
+	data[3] = stmt.mc.sequence
 
-	// code [1 byte]
-	data = append(data, byte(COM_STMT_EXECUTE))
+	// command [1 byte]
+	data[4] = comStmtExecute
 
 	// statement_id [4 bytes]
-	data = append(data, uint32ToBytes(stmt.id)...)
+	data[5] = byte(stmt.id)
+	data[6] = byte(stmt.id >> 8)
+	data[7] = byte(stmt.id >> 16)
+	data[8] = byte(stmt.id >> 24)
 
 	// flags (0: CURSOR_TYPE_NO_CURSOR) [1 byte]
-	data = append(data, byte(0))
+	//data[9] = 0x00
 
-	// iteration_count [4 bytes]
-	data = append(data, uint32ToBytes(1)...)
+	// iteration_count (uint32(1)) [4 bytes]
+	data[10] = 0x01
+	//data[11] = 0x00
+	//data[12] = 0x00
+	//data[13] = 0x00
 
-	// append nullBitMap [(param_count+7)/8 bytes]
 	if stmt.paramCount > 0 {
+		// NULL-bitmap [(param_count+7)/8 bytes]
+		pos := 14 + ((stmt.paramCount + 7) >> 3)
 		// Convert bitMask to bytes
-		nullBitMap := make([]byte, (stmt.paramCount+7)/8)
-		for i = 0; i < len(nullBitMap); i++ {
-			nullBitMap[i] = byte(bitMask >> uint(i*8))
+		for i = 14; i < pos; i++ {
+			data[i] = byte(bitMask >> uint((i-14)<<3))
 		}
 
-		data = append(data, nullBitMap...)
-	}
-
-	// newParameterBoundFlag 1 [1 byte]
-	data = append(data, byte(1))
-
-	// type of parameters [n*2 byte]
-	data = append(data, paramTypes...)
-
-	// values for the parameters [n byte]
-	for _, paramValue := range paramValues {
-		data = append(data, paramValue...)
-	}
-
-	return stmt.mc.writePacket(&data)
-}
-
-func (mc *mysqlConn) readBinaryRows(rc *rowsContent) (e error) {
-	var data, nullBitMap []byte
-	var i, pos, n int
-	var unsigned, isNull bool
-	columnsCount := len(rc.columns)
-
-	for {
-		data, e = mc.readPacket()
-		if e != nil {
-			return
-		}
-
-		pos = 0
-
-		// EOF Packet
-		if data[pos] == 254 && len(data) == 5 {
-			return
-		}
-
+		// newParameterBoundFlag 1 [1 byte]
+		data[pos] = 0x01
 		pos++
 
-		// BinaryRowSet Packet
-		row := make([][]byte, columnsCount)
+		// type of parameters [param_count*2 bytes]
+		pos += copy(data[pos:], paramTypes)
 
-		nullBitMap = data[pos : pos+(columnsCount+7+2)/8]
-		pos += (columnsCount + 7 + 2) / 8
+		// values for the parameters [n bytes]
+		for i = range paramValues {
+			pos += copy(data[pos:], paramValues[i])
+		}
+	}
 
-		for i = 0; i < columnsCount; i++ {
-			// Field is NULL
-			if (nullBitMap[(i+2)/8] >> uint((i+2)%8) & 1) == 1 {
-				row[i] = nil
+	return stmt.mc.writePacket(data)
+}
+
+// http://dev.mysql.com/doc/internals/en/prepared-statements.html#packet-ProtocolBinary::ResultsetRow
+func (rc *mysqlRows) readBinaryRow(dest []driver.Value) (err error) {
+	data, err := rc.mc.readPacket()
+	if err != nil {
+		return
+	}
+
+	// packet indicator [1 byte]
+	if data[0] != iOK {
+		// EOF Packet
+		if data[0] == iEOF && len(data) == 5 {
+			return io.EOF
+		} else {
+			// Error otherwise
+			return rc.mc.handleErrorPacket(data)
+		}
+	}
+
+	// NULL-bitmap,  [(column-count + 7 + 2) / 8 bytes]
+	pos := 1 + (len(dest)+7+2)>>3
+	nullBitMap := data[1:pos]
+
+	// values [rest]
+	var n int
+	var unsigned bool
+
+	for i := range dest {
+		// Field is NULL
+		// (byte >> bit-pos) % 2 == 1
+		if ((nullBitMap[(i+2)>>3] >> uint((i+2)&7)) & 1) == 1 {
+			dest[i] = nil
+			continue
+		}
+
+		unsigned = rc.columns[i].flags&flagUnsigned != 0
+
+		// Convert to byte-coded string
+		switch rc.columns[i].fieldType {
+		case fieldTypeNULL:
+			dest[i] = nil
+			continue
+
+		// Numeric Types
+		case fieldTypeTiny:
+			if unsigned {
+				dest[i] = int64(data[pos])
+			} else {
+				dest[i] = int64(int8(data[pos]))
+			}
+			pos++
+			continue
+
+		case fieldTypeShort, fieldTypeYear:
+			if unsigned {
+				dest[i] = int64(binary.LittleEndian.Uint16(data[pos : pos+2]))
+			} else {
+				dest[i] = int64(int16(binary.LittleEndian.Uint16(data[pos : pos+2])))
+			}
+			pos += 2
+			continue
+
+		case fieldTypeInt24, fieldTypeLong:
+			if unsigned {
+				dest[i] = int64(binary.LittleEndian.Uint32(data[pos : pos+4]))
+			} else {
+				dest[i] = int64(int32(binary.LittleEndian.Uint32(data[pos : pos+4])))
+			}
+			pos += 4
+			continue
+
+		case fieldTypeLongLong:
+			if unsigned {
+				val := binary.LittleEndian.Uint64(data[pos : pos+8])
+				if val > math.MaxInt64 {
+					dest[i] = uint64ToString(val)
+				} else {
+					dest[i] = int64(val)
+				}
+			} else {
+				dest[i] = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
+			}
+			pos += 8
+			continue
+
+		case fieldTypeFloat:
+			dest[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(data[pos : pos+4])))
+			pos += 4
+			continue
+
+		case fieldTypeDouble:
+			dest[i] = math.Float64frombits(binary.LittleEndian.Uint64(data[pos : pos+8]))
+			pos += 8
+			continue
+
+		// Length coded Binary Strings
+		case fieldTypeDecimal, fieldTypeNewDecimal, fieldTypeVarChar,
+			fieldTypeBit, fieldTypeEnum, fieldTypeSet, fieldTypeTinyBLOB,
+			fieldTypeMediumBLOB, fieldTypeLongBLOB, fieldTypeBLOB,
+			fieldTypeVarString, fieldTypeString, fieldTypeGeometry:
+			var isNull bool
+			dest[i], isNull, n, err = readLengthEnodedString(data[pos:])
+			pos += n
+			if err == nil {
+				if !isNull {
+					continue
+				} else {
+					dest[i] = nil
+					continue
+				}
+			}
+			return // err
+
+		// Date YYYY-MM-DD
+		case fieldTypeDate, fieldTypeNewDate:
+			var num uint64
+			var isNull bool
+			num, isNull, n = readLengthEncodedInteger(data[pos:])
+
+			pos += n
+
+			if num == 0 {
+				if isNull {
+					dest[i] = nil
+					continue
+				} else {
+					dest[i] = []byte("0000-00-00")
+					continue
+				}
+			} else {
+				dest[i] = []byte(fmt.Sprintf("%04d-%02d-%02d",
+					binary.LittleEndian.Uint16(data[pos:pos+2]),
+					data[pos+2],
+					data[pos+3]))
+				pos += int(num)
 				continue
 			}
 
-			unsigned = rc.columns[i].flags&FLAG_UNSIGNED != 0
+		// Time [-][H]HH:MM:SS[.fractal]
+		case fieldTypeTime:
+			var num uint64
+			var isNull bool
+			num, isNull, n = readLengthEncodedInteger(data[pos:])
 
-			// Convert to byte-coded string
-			switch rc.columns[i].fieldType {
-			case FIELD_TYPE_NULL:
-				row[i] = nil
+			pos += n
 
-			// Numeric Typs
-			case FIELD_TYPE_TINY:
-				if unsigned {
-					row[i] = uintToByteStr(uint64(byteToUint8(data[pos])))
+			if num == 0 {
+				if isNull {
+					dest[i] = nil
+					continue
 				} else {
-					row[i] = intToByteStr(int64(int8(byteToUint8(data[pos]))))
+					dest[i] = []byte("00:00:00")
+					continue
 				}
-				pos++
-
-			case FIELD_TYPE_SHORT, FIELD_TYPE_YEAR:
-				if unsigned {
-					row[i] = uintToByteStr(uint64(bytesToUint16(data[pos : pos+2])))
-				} else {
-					row[i] = intToByteStr(int64(int16(bytesToUint16(data[pos : pos+2]))))
-				}
-				pos += 2
-
-			case FIELD_TYPE_INT24, FIELD_TYPE_LONG:
-				if unsigned {
-					row[i] = uintToByteStr(uint64(bytesToUint32(data[pos : pos+4])))
-				} else {
-					row[i] = intToByteStr(int64(int32(bytesToUint32(data[pos : pos+4]))))
-				}
-				pos += 4
-
-			case FIELD_TYPE_LONGLONG:
-				if unsigned {
-					row[i] = uintToByteStr(bytesToUint64(data[pos : pos+8]))
-				} else {
-					row[i] = intToByteStr(int64(bytesToUint64(data[pos : pos+8])))
-				}
-				pos += 8
-
-			case FIELD_TYPE_FLOAT:
-				row[i] = float32ToByteStr(bytesToFloat32(data[pos : pos+4]))
-				pos += 4
-
-			case FIELD_TYPE_DOUBLE:
-				row[i] = float64ToByteStr(bytesToFloat64(data[pos : pos+8]))
-				pos += 8
-
-			case FIELD_TYPE_DECIMAL, FIELD_TYPE_NEWDECIMAL:
-				row[i], n, isNull, e = readLengthCodedBinary(data[pos:])
-				if e != nil {
-					return
-				}
-
-				if isNull && rc.columns[i].flags&FLAG_NOT_NULL == 0 {
-					row[i] = nil
-				}
-				pos += n
-
-			// Length coded Binary Strings
-			case FIELD_TYPE_VARCHAR, FIELD_TYPE_BIT, FIELD_TYPE_ENUM,
-				FIELD_TYPE_SET, FIELD_TYPE_TINY_BLOB, FIELD_TYPE_MEDIUM_BLOB,
-				FIELD_TYPE_LONG_BLOB, FIELD_TYPE_BLOB, FIELD_TYPE_VAR_STRING,
-				FIELD_TYPE_STRING, FIELD_TYPE_GEOMETRY:
-				row[i], n, isNull, e = readLengthCodedBinary(data[pos:])
-				if e != nil {
-					return
-				}
-
-				if isNull && rc.columns[i].flags&FLAG_NOT_NULL == 0 {
-					row[i] = nil
-				}
-				pos += n
-
-			// Date YYYY-MM-DD
-			case FIELD_TYPE_DATE, FIELD_TYPE_NEWDATE:
-				var num uint64
-				num, n, e = bytesToLengthCodedBinary(data[pos:])
-				if e != nil {
-					return
-				}
-				pos += n
-
-				if num == 0 {
-					row[i] = []byte("0000-00-00")
-				} else {
-					row[i] = []byte(fmt.Sprintf("%04d-%02d-%02d",
-						bytesToUint16(data[pos:pos+2]),
-						data[pos+2],
-						data[pos+3]))
-				}
-				pos += int(num)
-
-			// Time HH:MM:SS
-			case FIELD_TYPE_TIME:
-				var num uint64
-				num, n, e = bytesToLengthCodedBinary(data[pos:])
-				if e != nil {
-					return
-				}
-
-				if num == 0 {
-					row[i] = []byte("00:00:00")
-				} else {
-					row[i] = []byte(fmt.Sprintf("%02d:%02d:%02d",
-						data[pos+6],
-						data[pos+7],
-						data[pos+8]))
-				}
-				pos += n + int(num)
-
-			// Timestamp YYYY-MM-DD HH:MM:SS
-			case FIELD_TYPE_TIMESTAMP, FIELD_TYPE_DATETIME:
-				var num uint64
-				num, n, e = bytesToLengthCodedBinary(data[pos:])
-				if e != nil {
-					return
-				}
-				pos += n
-
-				switch num {
-				case 0:
-					row[i] = []byte("0000-00-00 00:00:00")
-				case 4:
-					row[i] = []byte(fmt.Sprintf("%04d-%02d-%02d 00:00:00",
-						bytesToUint16(data[pos:pos+2]),
-						data[pos+2],
-						data[pos+3]))
-				default:
-					if num < 7 {
-						return fmt.Errorf("Invalid datetime-packet length %d", num)
-					}
-					row[i] = []byte(fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d",
-						bytesToUint16(data[pos:pos+2]),
-						data[pos+2],
-						data[pos+3],
-						data[pos+4],
-						data[pos+5],
-						data[pos+6]))
-				}
-				pos += int(num)
-
-			// Please report if this happens!
-			default:
-				return fmt.Errorf("Unknown FieldType %d", rc.columns[i].fieldType)
 			}
+
+			var sign byte
+			if data[pos] == 1 {
+				sign = byte('-')
+			}
+
+			switch num {
+			case 8:
+				dest[i] = []byte(fmt.Sprintf(
+					"%c%02d:%02d:%02d",
+					sign,
+					uint16(data[pos+1])*24+uint16(data[pos+5]),
+					data[pos+6],
+					data[pos+7],
+				))
+				pos += 8
+				continue
+			case 12:
+				dest[i] = []byte(fmt.Sprintf(
+					"%c%02d:%02d:%02d.%06d",
+					sign,
+					uint16(data[pos+1])*24+uint16(data[pos+5]),
+					data[pos+6],
+					data[pos+7],
+					binary.LittleEndian.Uint32(data[pos+8:pos+12]),
+				))
+				pos += 12
+				continue
+			default:
+				return fmt.Errorf("Invalid TIME-packet length %d", num)
+			}
+
+		// Timestamp YYYY-MM-DD HH:MM:SS[.fractal]
+		case fieldTypeTimestamp, fieldTypeDateTime:
+			var num uint64
+			var isNull bool
+			num, isNull, n = readLengthEncodedInteger(data[pos:])
+
+			pos += n
+
+			if num == 0 {
+				if isNull {
+					dest[i] = nil
+					continue
+				} else {
+					dest[i] = []byte("0000-00-00 00:00:00")
+					continue
+				}
+			}
+
+			switch num {
+			case 4:
+				dest[i] = []byte(fmt.Sprintf(
+					"%04d-%02d-%02d 00:00:00",
+					binary.LittleEndian.Uint16(data[pos:pos+2]),
+					data[pos+2],
+					data[pos+3],
+				))
+				pos += 4
+				continue
+			case 7:
+				dest[i] = []byte(fmt.Sprintf(
+					"%04d-%02d-%02d %02d:%02d:%02d",
+					binary.LittleEndian.Uint16(data[pos:pos+2]),
+					data[pos+2],
+					data[pos+3],
+					data[pos+4],
+					data[pos+5],
+					data[pos+6],
+				))
+				pos += 7
+				continue
+			case 11:
+				dest[i] = []byte(fmt.Sprintf(
+					"%04d-%02d-%02d %02d:%02d:%02d.%06d",
+					binary.LittleEndian.Uint16(data[pos:pos+2]),
+					data[pos+2],
+					data[pos+3],
+					data[pos+4],
+					data[pos+5],
+					data[pos+6],
+					binary.LittleEndian.Uint32(data[pos+7:pos+11]),
+				))
+				pos += 11
+				continue
+			default:
+				return fmt.Errorf("Invalid DATETIME-packet length %d", num)
+			}
+
+		// Please report if this happens!
+		default:
+			return fmt.Errorf("Unknown FieldType %d", rc.columns[i].fieldType)
 		}
-		rc.rows = append(rc.rows, &row)
 	}
 
-	mc.affectedRows = uint64(len(rc.rows))
 	return
 }
