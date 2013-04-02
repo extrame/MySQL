@@ -2,7 +2,7 @@
 //
 // Copyright 2012 Julien Schmidt. All rights reserved.
 // http://www.julienschmidt.com
-// 
+//
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -11,119 +11,83 @@ package mysql
 
 import (
 	"database/sql/driver"
-	"errors"
 )
 
-type stmtContent struct {
+type mysqlStmt struct {
 	mc         *mysqlConn
 	id         uint32
 	paramCount int
 	params     []mysqlField
 }
 
-type mysqlStmt struct {
-	*stmtContent
-}
-
-func (stmt mysqlStmt) Close() error {
-	e := stmt.mc.writeCommandPacket(COM_STMT_CLOSE, stmt.id)
+func (stmt *mysqlStmt) Close() (err error) {
+	err = stmt.mc.writeCommandPacketUint32(comStmtClose, stmt.id)
 	stmt.mc = nil
-	return e
+	return
 }
 
-func (stmt mysqlStmt) NumInput() int {
+func (stmt *mysqlStmt) NumInput() int {
 	return stmt.paramCount
 }
 
-func (stmt mysqlStmt) Exec(args []driver.Value) (driver.Result, error) {
-	if stmt.mc == nil {
-		return nil, errors.New(`Invalid Statement`)
-	}
+func (stmt *mysqlStmt) Exec(args []driver.Value) (driver.Result, error) {
 	stmt.mc.affectedRows = 0
 	stmt.mc.insertId = 0
 
 	// Send command
-	e := stmt.buildExecutePacket(&args)
-	if e != nil {
-		return nil, e
+	err := stmt.writeExecutePacket(args)
+	if err != nil {
+		return nil, err
 	}
 
 	// Read Result
 	var resLen int
-	resLen, e = stmt.mc.readResultSetHeaderPacket()
-	if e != nil {
-		return nil, e
-	}
+	resLen, err = stmt.mc.readResultSetHeaderPacket()
+	if err == nil {
+		if resLen > 0 {
+			// Columns
+			err = stmt.mc.readUntilEOF()
+			if err != nil {
+				return nil, err
+			}
 
-	if resLen > 0 {
-		// Columns
-		_, e = stmt.mc.readUntilEOF()
-		if e != nil {
-			return nil, e
+			// Rows
+			err = stmt.mc.readUntilEOF()
 		}
-
-		// Rows
-		stmt.mc.affectedRows, e = stmt.mc.readUntilEOF()
-		if e != nil {
-			return nil, e
+		if err == nil {
+			return &mysqlResult{
+				affectedRows: int64(stmt.mc.affectedRows),
+				insertId:     int64(stmt.mc.insertId),
+			}, nil
 		}
 	}
-	if e != nil {
-		return nil, e
-	}
 
-	if stmt.mc.affectedRows == 0 {
-		return driver.ResultNoRows, nil
-	}
-
-	return mysqlResult{
-			affectedRows: int64(stmt.mc.affectedRows),
-			insertId:     int64(stmt.mc.insertId)},
-		nil
+	return nil, err
 }
 
-func (stmt mysqlStmt) Query(args []driver.Value) (dr driver.Rows, e error) {
-	if stmt.mc == nil {
-		return nil, errors.New(`Invalid Statement`)
-	}
-
+func (stmt *mysqlStmt) Query(args []driver.Value) (driver.Rows, error) {
 	// Send command
-	e = stmt.buildExecutePacket(&args)
-	if e != nil {
-		return nil, e
+	err := stmt.writeExecutePacket(args)
+	if err != nil {
+		return nil, err
 	}
 
-	// Get Result
+	// Read Result
 	var resLen int
-	rows := mysqlRows{new(rowsContent)}
-	resLen, e = stmt.mc.readResultSetHeaderPacket()
-	if e != nil {
-		return nil, e
+	resLen, err = stmt.mc.readResultSetHeaderPacket()
+	if err != nil {
+		return nil, err
 	}
+
+	rows := &mysqlRows{stmt.mc, true, nil, false}
 
 	if resLen > 0 {
 		// Columns
-		rows.content.columns, e = stmt.mc.readColumns(resLen)
-		if e != nil {
-			return
-		}
-
-		// Rows
-		e = stmt.mc.readBinaryRows(rows.content)
-		if e != nil {
-			return
+		rows.columns, err = stmt.mc.readColumns(resLen)
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	dr = rows
-	return
+	return rows, err
 }
-
-// ColumnConverter returns a ValueConverter for the provided
-// column index.  If the type of a specific column isn't known
-// or shouldn't be handled specially, DefaultValueConverter
-// can be returned.
-//func (stmt mysqlStmt) ColumnConverter(idx int) driver.ValueConverter {
-//	debug(fmt.Sprintf("ColumnConverter(%d)", idx))
-//	return driver.DefaultParameterConverter
-//}

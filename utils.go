@@ -2,7 +2,7 @@
 //
 // Copyright 2012 Julien Schmidt. All rights reserved.
 // http://www.julienschmidt.com
-// 
+//
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -10,26 +10,21 @@
 package mysql
 
 import (
-	"bytes"
 	"crypto/sha1"
 	"io"
 	"log"
-	"math"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 )
 
 // Logger
 var (
 	errLog *log.Logger
-	dbgLog *log.Logger
 )
 
 func init() {
-	errLog = log.New(os.Stderr, "[MySQL] ", log.LstdFlags)
-	dbgLog = log.New(os.Stdout, "[MySQL] ", log.LstdFlags)
+	errLog = log.New(os.Stderr, "[MySQL] ", log.Ldate|log.Ltime|log.Lshortfile)
 
 	dsnPattern = regexp.MustCompile(
 		`^(?:(?P<user>.*?)(?::(?P<passwd>.*))?@)?` + // [user[:password]@]
@@ -86,232 +81,162 @@ func parseDSN(dsn string) *config {
 
 // Encrypt password using 4.1+ method
 // http://forge.mysql.com/wiki/MySQL_Internals_ClientServer_Protocol#4.1_and_later
-func scramblePassword(scramble, password []byte) (result []byte) {
+func scramblePassword(scramble, password []byte) []byte {
 	if len(password) == 0 {
-		return
+		return nil
 	}
 
 	// stage1Hash = SHA1(password)
 	crypt := sha1.New()
 	crypt.Write(password)
-	stage1Hash := crypt.Sum(nil)
+	stage1 := crypt.Sum(nil)
 
 	// scrambleHash = SHA1(scramble + SHA1(stage1Hash))
 	// inner Hash
 	crypt.Reset()
-	crypt.Write(stage1Hash)
-	scrambleHash := crypt.Sum(nil)
+	crypt.Write(stage1)
+	hash := crypt.Sum(nil)
 
 	// outer Hash
 	crypt.Reset()
 	crypt.Write(scramble)
-	crypt.Write(scrambleHash)
-	scrambleHash = crypt.Sum(nil)
+	crypt.Write(hash)
+	scramble = crypt.Sum(nil)
 
 	// token = scrambleHash XOR stage1Hash
-	result = make([]byte, 20)
-	for i := range result {
-		result[i] = scrambleHash[i] ^ stage1Hash[i]
+	for i := range scramble {
+		scramble[i] ^= stage1[i]
 	}
-	return
-}
-
-/******************************************************************************
-*                       Read data-types from bytes                            *
-******************************************************************************/
-
-// Read a slice from the data slice
-func readSlice(data []byte, delim byte) (slice []byte, e error) {
-	pos := bytes.IndexByte(data, delim)
-	if pos > -1 {
-		slice = data[:pos]
-	} else {
-		slice = data
-		e = io.EOF
-	}
-	return
-}
-
-func readLengthCodedBinary(data []byte) (b []byte, n int, isNull bool, e error) {
-	// Get length
-	num, n, e := bytesToLengthCodedBinary(data)
-	if e != nil {
-		return
-	}
-
-	// Check data length
-	if len(data) < n+int(num) {
-		e = io.EOF
-		return
-	}
-
-	// Check if null
-	if data[0] == 251 {
-		isNull = true
-	} else {
-		isNull = false
-	}
-
-	// Get bytes
-	b = data[n : n+int(num)]
-	n += int(num)
-	return
-}
-
-func readAndDropLengthCodedBinary(data []byte) (n int, e error) {
-	// Get length
-	num, n, e := bytesToLengthCodedBinary(data)
-	if e != nil {
-		return
-	}
-
-	// Check data length
-	if len(data) < n+int(num) {
-		e = io.EOF
-		return
-	}
-
-	n += int(num)
-	return
+	return scramble
 }
 
 /******************************************************************************
 *                       Convert from and to bytes                             *
 ******************************************************************************/
 
-func byteToUint8(b byte) (n uint8) {
-	n |= uint8(b)
-	return
-}
-
-func bytesToUint16(b []byte) (n uint16) {
-	n |= uint16(b[0])
-	n |= uint16(b[1]) << 8
-	return
-}
-
-func uint24ToBytes(n uint32) (b []byte) {
-	b = make([]byte, 3)
-	for i := uint8(0); i < 3; i++ {
-		b[i] = byte(n >> (i * 8))
+func uint64ToBytes(n uint64) []byte {
+	return []byte{
+		byte(n),
+		byte(n >> 8),
+		byte(n >> 16),
+		byte(n >> 24),
+		byte(n >> 32),
+		byte(n >> 40),
+		byte(n >> 48),
+		byte(n >> 56),
 	}
-	return
 }
 
-func bytesToUint32(b []byte) (n uint32) {
-	for i := uint8(0); i < 4; i++ {
-		n |= uint32(b[i]) << (i * 8)
+func uint64ToString(n uint64) []byte {
+	var a [20]byte
+	i := 20
+
+	// U+0030 = 0
+	// ...
+	// U+0039 = 9
+
+	var q uint64
+	for n >= 10 {
+		i--
+		q = n / 10
+		a[i] = uint8(n-q*10) + 0x30
+		n = q
 	}
-	return
+
+	i--
+	a[i] = uint8(n) + 0x30
+
+	return a[i:]
 }
 
-func uint32ToBytes(n uint32) (b []byte) {
-	b = make([]byte, 4)
-	for i := uint8(0); i < 4; i++ {
-		b[i] = byte(n >> (i * 8))
+// treats string value as unsigned integer representation
+func stringToInt(b []byte) int {
+	val := 0
+	for i := range b {
+		val *= 10
+		val += int(b[i] - 0x30)
 	}
-	return
+	return val
 }
 
-func bytesToUint64(b []byte) (n uint64) {
-	for i := uint8(0); i < 8; i++ {
-		n |= uint64(b[i]) << (i * 8)
+func readLengthEnodedString(b []byte) ([]byte, bool, int, error) {
+	// Get length
+	num, isNull, n := readLengthEncodedInteger(b)
+	if num < 1 {
+		return nil, isNull, n, nil
 	}
-	return
-}
 
-func uint64ToBytes(n uint64) (b []byte) {
-	b = make([]byte, 8)
-	for i := uint8(0); i < 8; i++ {
-		b[i] = byte(n >> (i * 8))
+	n += int(num)
+
+	// Check data length
+	if len(b) >= n {
+		return b[n-int(num) : n], false, n, nil
 	}
-	return
+	return nil, false, n, io.EOF
 }
 
-func int64ToBytes(n int64) []byte {
-	return uint64ToBytes(uint64(n))
+func skipLengthEnodedString(b []byte) (int, error) {
+	// Get length
+	num, _, n := readLengthEncodedInteger(b)
+	if num < 1 {
+		return n, nil
+	}
+
+	n += int(num)
+
+	// Check data length
+	if len(b) >= n {
+		return n, nil
+	}
+	return n, io.EOF
 }
 
-func bytesToFloat32(b []byte) float32 {
-	return math.Float32frombits(bytesToUint32(b))
-}
-
-func bytesToFloat64(b []byte) float64 {
-	return math.Float64frombits(bytesToUint64(b))
-}
-
-func float64ToBytes(f float64) []byte {
-	return uint64ToBytes(math.Float64bits(f))
-}
-
-func bytesToLengthCodedBinary(b []byte) (length uint64, n int, e error) {
-	switch {
-
-	// 0-250: value of first byte
-	case b[0] <= 250:
-		length = uint64(b[0])
-		n = 1
-		return
+func readLengthEncodedInteger(b []byte) (num uint64, isNull bool, n int) {
+	switch b[0] {
 
 	// 251: NULL
-	case b[0] == 251:
-		length = 0
+	case 0xfb:
 		n = 1
+		isNull = true
 		return
 
 	// 252: value of following 2
-	case b[0] == 252:
+	case 0xfc:
+		num = uint64(b[1]) | uint64(b[2])<<8
 		n = 3
+		return
 
 	// 253: value of following 3
-	case b[0] == 253:
+	case 0xfd:
+		num = uint64(b[1]) | uint64(b[2])<<8 | uint64(b[3])<<16
 		n = 4
+		return
 
 	// 254: value of following 8
-	case b[0] == 254:
+	case 0xfe:
+		num = uint64(b[1]) | uint64(b[2])<<8 | uint64(b[3])<<16 |
+			uint64(b[4])<<24 | uint64(b[5])<<32 | uint64(b[6])<<40 |
+			uint64(b[7])<<48 | uint64(b[8])<<54
 		n = 9
-	}
-
-	if len(b) < n {
-		e = io.EOF
 		return
 	}
 
-	// get Length
-	tmp := make([]byte, 8)
-	copy(tmp, b[1:n])
-	length = bytesToUint64(tmp)
+	// 0-250: value of first byte
+	num = uint64(b[0])
+	n = 1
 	return
 }
 
-func lengthCodedBinaryToBytes(n uint64) (b []byte) {
+func lengthEncodedIntegerToBytes(n uint64) []byte {
 	switch {
-
 	case n <= 250:
-		b = []byte{byte(n)}
+		return []byte{byte(n)}
 
 	case n <= 0xffff:
-		b = []byte{0xfc, byte(n), byte(n >> 8)}
+		return []byte{0xfc, byte(n), byte(n >> 8)}
 
 	case n <= 0xffffff:
-		b = []byte{0xfd, byte(n), byte(n >> 8), byte(n >> 16)}
+		return []byte{0xfd, byte(n), byte(n >> 8), byte(n >> 16)}
 	}
-	return
-}
-
-func intToByteStr(i int64) (b []byte) {
-	//tmp := make([]byte, 0)
-	return strconv.AppendInt(b, i, 10)
-}
-
-func uintToByteStr(u uint64) (b []byte) {
-	return strconv.AppendUint(b, u, 10)
-}
-
-func float32ToByteStr(f float32) (b []byte) {
-	return strconv.AppendFloat(b, float64(f), 'f', -1, 32)
-}
-
-func float64ToByteStr(f float64) (b []byte) {
-	return strconv.AppendFloat(b, f, 'f', -1, 64)
+	return nil
 }
