@@ -10,16 +10,17 @@
 package mysql
 
 import (
+	"crypto/tls"
 	"database/sql/driver"
 	"errors"
 	"net"
 	"strings"
+	"time"
 )
 
 type mysqlConn struct {
 	cfg              *config
 	flags            clientFlag
-	charset          byte
 	cipher           []byte
 	netConn          net.Conn
 	buf              *buffer
@@ -29,15 +30,22 @@ type mysqlConn struct {
 	insertId         uint64
 	maxPacketAllowed int
 	maxWriteSize     int
+	parseTime        bool
+	strict           bool
 }
 
 type config struct {
-	user   string
-	passwd string
-	net    string
-	addr   string
-	dbname string
-	params map[string]string
+	user            string
+	passwd          string
+	net             string
+	addr            string
+	dbname          string
+	params          map[string]string
+	loc             *time.Location
+	timeout         time.Duration
+	tls             *tls.Config
+	allowAllFiles   bool
+	clientFoundRows bool
 }
 
 // Handles parameters set in DSN
@@ -58,18 +66,26 @@ func (mc *mysqlConn) handleParams() (err error) {
 				return
 			}
 
-		// handled elsewhere
-		case "timeout", "allowAllFiles":
-			continue
+		// time.Time parsing
+		case "parseTime":
+			var isBool bool
+			mc.parseTime, isBool = readBool(val)
+			if !isBool {
+				return errors.New("Invalid Bool value: " + val)
+			}
 
-		// TLS-Encryption
-		case "tls":
-			err = errors.New("TLS-Encryption not implemented yet")
-			return
+		// Strict mode
+		case "strict":
+			var isBool bool
+			mc.strict, isBool = readBool(val)
+			if !isBool {
+				return errors.New("Invalid Bool value: " + val)
+			}
 
 		// Compression
 		case "compress":
 			err = errors.New("Compression not implemented yet")
+			return
 
 		// System Vars
 		default:
@@ -200,6 +216,7 @@ func (mc *mysqlConn) Query(query string, args []driver.Value) (driver.Rows, erro
 }
 
 // Gets the value of the given MySQL System Variable
+// The returned byte slice is only valid until the next read
 func (mc *mysqlConn) getSystemVar(name string) (val []byte, err error) {
 	// Send command
 	err = mc.writeCommandPacketStr(comQuery, "SELECT @@"+name)

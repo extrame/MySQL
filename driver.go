@@ -6,40 +6,46 @@
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
 // Go MySQL Driver - A MySQL-Driver for Go's database/sql package
+//
+// The driver should be used via the database/sql package:
+//
+//  import "database/sql"
+//  import _ "github.com/go-sql-driver/mysql"
+//
+//  db, err := sql.Open("mysql", "user:password@/dbname")
+//
+// See https://github.com/go-sql-driver/mysql#usage for details
 package mysql
 
 import (
 	"database/sql"
 	"database/sql/driver"
 	"net"
-	"time"
 )
 
-type mysqlDriver struct{}
+// This struct is exported to make the driver directly accessible.
+// In general the driver is used via the database/sql package.
+type MySQLDriver struct{}
 
 // Open new Connection.
 // See https://github.com/go-sql-driver/mysql#dsn-data-source-name for how
 // the DSN string is formated
-func (d *mysqlDriver) Open(dsn string) (driver.Conn, error) {
+func (d *MySQLDriver) Open(dsn string) (driver.Conn, error) {
 	var err error
 
 	// New mysqlConn
 	mc := &mysqlConn{
-		cfg:              parseDSN(dsn),
 		maxPacketAllowed: maxPacketSize,
 		maxWriteSize:     maxPacketSize - 1,
 	}
+	mc.cfg, err = parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
 
 	// Connect to Server
-	if _, ok := mc.cfg.params["timeout"]; ok { // with timeout
-		var timeout time.Duration
-		timeout, err = time.ParseDuration(mc.cfg.params["timeout"])
-		if err == nil {
-			mc.netConn, err = net.DialTimeout(mc.cfg.net, mc.cfg.addr, timeout)
-		}
-	} else { // no timeout
-		mc.netConn, err = net.Dial(mc.cfg.net, mc.cfg.addr)
-	}
+	nd := net.Dialer{Timeout: mc.cfg.timeout}
+	mc.netConn, err = nd.Dial(mc.cfg.net, mc.cfg.addr)
 	if err != nil {
 		return nil, err
 	}
@@ -83,5 +89,5 @@ func (d *mysqlDriver) Open(dsn string) (driver.Conn, error) {
 }
 
 func init() {
-	sql.Register("mysql", &mysqlDriver{})
+	sql.Register("mysql", &MySQLDriver{})
 }
