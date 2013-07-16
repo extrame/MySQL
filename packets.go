@@ -11,9 +11,9 @@ package mysql
 
 import (
 	"bytes"
+	"crypto/tls"
 	"database/sql/driver"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -26,15 +26,14 @@ import (
 // Read packet to buffer 'data'
 func (mc *mysqlConn) readPacket() (data []byte, err error) {
 	// Read packet header
-	data = make([]byte, 4)
-	err = mc.buf.read(data)
+	data, err = mc.buf.readNext(4)
 	if err != nil {
 		errLog.Print(err.Error())
 		return nil, driver.ErrBadConn
 	}
 
 	// Packet Length [24 bit]
-	pktLen := uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16
+	pktLen := int(uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16)
 
 	if pktLen < 1 {
 		errLog.Print(errMalformPkt.Error())
@@ -52,18 +51,19 @@ func (mc *mysqlConn) readPacket() (data []byte, err error) {
 	mc.sequence++
 
 	// Read packet body [pktLen bytes]
-	data = make([]byte, pktLen)
-	err = mc.buf.read(data)
+	data, err = mc.buf.readNext(pktLen)
 	if err == nil {
 		if pktLen < maxPacketSize {
 			return data, nil
 		}
 
+		var buf []byte
+		buf = append(buf, data...)
+
 		// More data
-		var data2 []byte
-		data2, err = mc.readPacket()
+		data, err = mc.readPacket()
 		if err == nil {
-			return append(data, data2...), nil
+			return append(buf, data...), nil
 		}
 	}
 	errLog.Print(err.Error())
@@ -169,14 +169,15 @@ func (mc *mysqlConn) readInitPacket() (err error) {
 	// capability flags (lower 2 bytes) [2 bytes]
 	mc.flags = clientFlag(binary.LittleEndian.Uint16(data[pos : pos+2]))
 	if mc.flags&clientProtocol41 == 0 {
-		err = errors.New("MySQL-Server does not support required Protocol 41+")
+		err = errOldProtocol
+	}
+	if mc.flags&clientSSL == 0 && mc.cfg.tls != nil {
+		return errNoTLS
 	}
 	pos += 2
 
 	if len(data) > pos {
 		// character set [1 byte]
-		mc.charset = data[pos]
-
 		// status flags [2 bytes]
 		// capability flags (upper 2 bytes) [2 bytes]
 		// length of auth-plugin-data [1 byte]
@@ -189,10 +190,15 @@ func (mc *mysqlConn) readInitPacket() (err error) {
 		// which is not documented but seems to work.
 		mc.cipher = append(mc.cipher, data[pos:pos+12]...)
 
-		if data[len(data)-1] == 0 {
-			return
-		}
-		return errMalformPkt
+		// TODO: Verify string termination
+		// EOF if version (>= 5.5.7 and < 5.5.10) or (>= 5.6.0 and < 5.6.2)
+		// \NUL otherwise
+		// http://dev.mysql.com/doc/internals/en/connection-phase.html#packet-Protocol::Handshake
+		//
+		//if data[len(data)-1] == 0 {
+		//	return
+		//}
+		//return errMalformPkt
 	}
 
 	return
@@ -202,15 +208,20 @@ func (mc *mysqlConn) readInitPacket() (err error) {
 // http://dev.mysql.com/doc/internals/en/connection-phase.html#packet-Protocol::HandshakeResponse
 func (mc *mysqlConn) writeAuthPacket() error {
 	// Adjust client flags based on server support
-	clientFlags := uint32(
-		clientProtocol41 |
-			clientSecureConn |
-			clientLongPassword |
-			clientTransactions |
-			clientLocalFiles,
-	)
-	if mc.flags&clientLongFlag > 0 {
-		clientFlags |= uint32(clientLongFlag)
+	clientFlags := clientProtocol41 |
+		clientSecureConn |
+		clientLongPassword |
+		clientTransactions |
+		clientLocalFiles |
+		mc.flags&clientLongFlag
+
+	if mc.cfg.clientFoundRows {
+		clientFlags |= clientFoundRows
+	}
+
+	// To enable TLS / SSL
+	if mc.cfg.tls != nil {
+		clientFlags |= clientSSL
 	}
 
 	// User Password
@@ -220,19 +231,13 @@ func (mc *mysqlConn) writeAuthPacket() error {
 	pktLen := 4 + 4 + 1 + 23 + len(mc.cfg.user) + 1 + 1 + len(scrambleBuff)
 
 	// To specify a db name
-	if len(mc.cfg.dbname) > 0 {
-		clientFlags |= uint32(clientConnectWithDB)
-		pktLen += len(mc.cfg.dbname) + 1
+	if n := len(mc.cfg.dbname); n > 0 {
+		clientFlags |= clientConnectWithDB
+		pktLen += n + 1
 	}
 
 	// Calculate packet length and make buffer with that size
 	data := make([]byte, pktLen+4)
-
-	// Add the packet header  [24bit length + 1 byte sequence]
-	data[0] = byte(pktLen)
-	data[1] = byte(pktLen >> 8)
-	data[2] = byte(pktLen >> 16)
-	data[3] = mc.sequence
 
 	// ClientFlags [32 bit]
 	data[4] = byte(clientFlags)
@@ -247,7 +252,36 @@ func (mc *mysqlConn) writeAuthPacket() error {
 	//data[11] = 0x00
 
 	// Charset [1 byte]
-	data[12] = mc.charset
+	data[12] = collation_utf8_general_ci
+
+	// SSL Connection Request Packet
+	// http://dev.mysql.com/doc/internals/en/connection-phase.html#packet-Protocol::SSLRequest
+	if mc.cfg.tls != nil {
+		// Packet header  [24bit length + 1 byte sequence]
+		data[0] = byte((4 + 4 + 1 + 23))
+		data[1] = byte((4 + 4 + 1 + 23) >> 8)
+		data[2] = byte((4 + 4 + 1 + 23) >> 16)
+		data[3] = mc.sequence
+
+		// Send TLS / SSL request packet
+		if err := mc.writePacket(data[:(4+4+1+23)+4]); err != nil {
+			return err
+		}
+
+		// Switch to TLS
+		tlsConn := tls.Client(mc.netConn, mc.cfg.tls)
+		if err := tlsConn.Handshake(); err != nil {
+			return err
+		}
+		mc.netConn = tlsConn
+		mc.buf.rd = tlsConn
+	}
+
+	// Add the packet header  [24bit length + 1 byte sequence]
+	data[0] = byte(pktLen)
+	data[1] = byte(pktLen >> 8)
+	data[2] = byte(pktLen >> 16)
+	data[3] = mc.sequence
 
 	// Filler [23 bytes] (all 0x00)
 	pos := 13 + 23
@@ -284,7 +318,7 @@ func (mc *mysqlConn) writeCommandPacket(command byte) error {
 	// Send CMD packet
 	return mc.writePacket([]byte{
 		// Add the packet header [24bit length + 1 byte sequence]
-		0x05, // 5 bytes long
+		0x01, // 1 byte long
 		0x00,
 		0x00,
 		0x00, // mc.sequence
@@ -352,8 +386,7 @@ func (mc *mysqlConn) readResultOK() error {
 		switch data[0] {
 
 		case iOK:
-			mc.handleOkPacket(data)
-			return nil
+			return mc.handleOkPacket(data)
 
 		case iEOF: // someone is using old_passwords
 			return errOldPassword
@@ -373,8 +406,7 @@ func (mc *mysqlConn) readResultSetHeaderPacket() (int, error) {
 		switch data[0] {
 
 		case iOK:
-			mc.handleOkPacket(data)
-			return 0, nil
+			return 0, mc.handleOkPacket(data)
 
 		case iERR:
 			return 0, mc.handleErrorPacket(data)
@@ -415,13 +447,16 @@ func (mc *mysqlConn) handleErrorPacket(data []byte) error {
 	}
 
 	// Error Message [string]
-	return fmt.Errorf("Error %d: %s", errno, string(data[pos:]))
+	return &MySQLError{
+		Number:  errno,
+		Message: string(data[pos:]),
+	}
 }
 
 // Ok Packet
 // http://dev.mysql.com/doc/internals/en/overview.html#packet-OK_Packet
-func (mc *mysqlConn) handleOkPacket(data []byte) {
-	var n int
+func (mc *mysqlConn) handleOkPacket(data []byte) (err error) {
+	var n, m int
 
 	// 0x00 [1 byte]
 
@@ -429,11 +464,22 @@ func (mc *mysqlConn) handleOkPacket(data []byte) {
 	mc.affectedRows, _, n = readLengthEncodedInteger(data[1:])
 
 	// Insert id [Length Coded Binary]
-	mc.insertId, _, _ = readLengthEncodedInteger(data[1+n:])
+	mc.insertId, _, m = readLengthEncodedInteger(data[1+n:])
 
 	// server_status [2 bytes]
+
 	// warning count [2 bytes]
+	if !mc.strict {
+		return
+	} else {
+		pos := 1 + n + m + 2
+		if binary.LittleEndian.Uint16(data[pos:pos+2]) > 0 {
+			err = mc.getWarnings()
+		}
+	}
+
 	// message [until end of packet]
+	return
 }
 
 // Read Packets as Field Packets until EOF-Packet or an Error appears
@@ -523,8 +569,6 @@ func (mc *mysqlConn) readColumns(count int) (columns []mysqlField, err error) {
 
 		i++
 	}
-
-	return
 }
 
 // Read Packets as Field Packets until EOF-Packet or an Error appears
@@ -551,7 +595,21 @@ func (rows *mysqlRows) readRow(dest []driver.Value) (err error) {
 		pos += n
 		if err == nil {
 			if !isNull {
-				continue
+				if !rows.mc.parseTime {
+					continue
+				} else {
+					switch rows.columns[i].fieldType {
+					case fieldTypeTimestamp, fieldTypeDateTime,
+						fieldTypeDate, fieldTypeNewDate:
+						dest[i], err = parseDateTime(string(dest[i].([]byte)), rows.mc.cfg.loc)
+						if err == nil {
+							continue
+						}
+					default:
+						continue
+					}
+				}
+
 			} else {
 				dest[i] = nil
 				continue
@@ -576,7 +634,6 @@ func (mc *mysqlConn) readUntilEOF() (err error) {
 		}
 		return // Err or EOF
 	}
-	return
 }
 
 /******************************************************************************
@@ -611,7 +668,13 @@ func (stmt *mysqlStmt) readPrepareResultPacket() (columnCount uint16, err error)
 		pos += 2
 
 		// Warning count [16 bit uint]
-		// bytesToUint16(data[pos : pos+2])
+		if !stmt.mc.strict {
+			return
+		} else {
+			if binary.LittleEndian.Uint16(data[pos:pos+2]) > 0 {
+				err = stmt.mc.getWarnings()
+			}
+		}
 	}
 	return
 }
@@ -669,7 +732,7 @@ func (stmt *mysqlStmt) writeCommandLongData(paramID int, arg []byte) (err error)
 func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	if len(args) != stmt.paramCount {
 		return fmt.Errorf(
-			"Arguments count mismatch (Got: %d Has: %d",
+			"Arguments count mismatch (Got: %d Has: %d)",
 			len(args),
 			stmt.paramCount)
 	}
@@ -751,7 +814,14 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 
 		case time.Time:
 			paramTypes[i<<1] = fieldTypeString
-			val := []byte(v.Format(timeFormat))
+
+			var val []byte
+			if v.IsZero() {
+				val = []byte("0000-00-00")
+			} else {
+				val = []byte(v.Format(timeFormat))
+			}
+
 			paramValues[i] = append(
 				lengthEncodedIntegerToBytes(uint64(len(val))),
 				val...,
@@ -815,8 +885,8 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 }
 
 // http://dev.mysql.com/doc/internals/en/prepared-statements.html#packet-ProtocolBinary::ResultsetRow
-func (rc *mysqlRows) readBinaryRow(dest []driver.Value) (err error) {
-	data, err := rc.mc.readPacket()
+func (rows *mysqlRows) readBinaryRow(dest []driver.Value) (err error) {
+	data, err := rows.mc.readPacket()
 	if err != nil {
 		return
 	}
@@ -828,7 +898,7 @@ func (rc *mysqlRows) readBinaryRow(dest []driver.Value) (err error) {
 			return io.EOF
 		} else {
 			// Error otherwise
-			return rc.mc.handleErrorPacket(data)
+			return rows.mc.handleErrorPacket(data)
 		}
 	}
 
@@ -848,10 +918,10 @@ func (rc *mysqlRows) readBinaryRow(dest []driver.Value) (err error) {
 			continue
 		}
 
-		unsigned = rc.columns[i].flags&flagUnsigned != 0
+		unsigned = rows.columns[i].flags&flagUnsigned != 0
 
 		// Convert to byte-coded string
-		switch rc.columns[i].fieldType {
+		switch rows.columns[i].fieldType {
 		case fieldTypeNULL:
 			dest[i] = nil
 			continue
@@ -934,21 +1004,22 @@ func (rc *mysqlRows) readBinaryRow(dest []driver.Value) (err error) {
 
 			pos += n
 
-			if num == 0 {
-				if isNull {
-					dest[i] = nil
-					continue
-				} else {
-					dest[i] = []byte("0000-00-00")
-					continue
-				}
+			if isNull {
+				dest[i] = nil
+				continue
+			}
+
+			if rows.mc.parseTime {
+				dest[i], err = parseBinaryDateTime(num, data[pos:], rows.mc.cfg.loc)
 			} else {
-				dest[i] = []byte(fmt.Sprintf("%04d-%02d-%02d",
-					binary.LittleEndian.Uint16(data[pos:pos+2]),
-					data[pos+2],
-					data[pos+3]))
+				dest[i], err = formatBinaryDate(num, data[pos:])
+			}
+
+			if err == nil {
 				pos += int(num)
 				continue
+			} else {
+				return err
 			}
 
 		// Time [-][H]HH:MM:SS[.fractal]
@@ -1008,58 +1079,27 @@ func (rc *mysqlRows) readBinaryRow(dest []driver.Value) (err error) {
 
 			pos += n
 
-			if num == 0 {
-				if isNull {
-					dest[i] = nil
-					continue
-				} else {
-					dest[i] = []byte("0000-00-00 00:00:00")
-					continue
-				}
+			if isNull {
+				dest[i] = nil
+				continue
 			}
 
-			switch num {
-			case 4:
-				dest[i] = []byte(fmt.Sprintf(
-					"%04d-%02d-%02d 00:00:00",
-					binary.LittleEndian.Uint16(data[pos:pos+2]),
-					data[pos+2],
-					data[pos+3],
-				))
-				pos += 4
+			if rows.mc.parseTime {
+				dest[i], err = parseBinaryDateTime(num, data[pos:], rows.mc.cfg.loc)
+			} else {
+				dest[i], err = formatBinaryDateTime(num, data[pos:])
+			}
+
+			if err == nil {
+				pos += int(num)
 				continue
-			case 7:
-				dest[i] = []byte(fmt.Sprintf(
-					"%04d-%02d-%02d %02d:%02d:%02d",
-					binary.LittleEndian.Uint16(data[pos:pos+2]),
-					data[pos+2],
-					data[pos+3],
-					data[pos+4],
-					data[pos+5],
-					data[pos+6],
-				))
-				pos += 7
-				continue
-			case 11:
-				dest[i] = []byte(fmt.Sprintf(
-					"%04d-%02d-%02d %02d:%02d:%02d.%06d",
-					binary.LittleEndian.Uint16(data[pos:pos+2]),
-					data[pos+2],
-					data[pos+3],
-					data[pos+4],
-					data[pos+5],
-					data[pos+6],
-					binary.LittleEndian.Uint32(data[pos+7:pos+11]),
-				))
-				pos += 11
-				continue
-			default:
-				return fmt.Errorf("Invalid DATETIME-packet length %d", num)
+			} else {
+				return err
 			}
 
 		// Please report if this happens!
 		default:
-			return fmt.Errorf("Unknown FieldType %d", rc.columns[i].fieldType)
+			return fmt.Errorf("Unknown FieldType %d", rows.columns[i].fieldType)
 		}
 	}
 

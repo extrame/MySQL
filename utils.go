@@ -11,16 +11,22 @@ package mysql
 
 import (
 	"crypto/sha1"
+	"crypto/tls"
+	"database/sql/driver"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 )
 
-// Logger
 var (
-	errLog *log.Logger
+	errLog            *log.Logger            // Error Logger
+	dsnPattern        *regexp.Regexp         // Data Source Name Parser
+	tlsConfigRegister map[string]*tls.Config // Register for custom tls.Configs
 )
 
 func init() {
@@ -31,13 +37,49 @@ func init() {
 			`(?:(?P<net>[^\(]*)(?:\((?P<addr>[^\)]*)\))?)?` + // [net[(addr)]]
 			`\/(?P<dbname>.*?)` + // /dbname
 			`(?:\?(?P<params>[^\?]*))?$`) // [?param1=value1&paramN=valueN]
+
+	tlsConfigRegister = make(map[string]*tls.Config)
 }
 
-// Data Source Name Parser
-var dsnPattern *regexp.Regexp
+// RegisterTLSConfig registers a custom tls.Config to be used with sql.Open.
+// Use the key as a value in the DSN where tls=value.
+//
+//  rootCertPool := x509.NewCertPool()
+//  pem, err := ioutil.ReadFile("/path/ca-cert.pem")
+//  if err != nil {
+//      log.Fatal(err)
+//  }
+//  if ok := rootCertPool.AppendCertsFromPEM(pem); !ok {
+//      log.Fatal("Failed to append PEM.")
+//  }
+//  clientCert := make([]tls.Certificate, 0, 1)
+//  certs, err := tls.LoadX509KeyPair("/path/client-cert.pem", "/path/client-key.pem")
+//  if err != nil {
+//      log.Fatal(err)
+//  }
+//  clientCert = append(clientCert, certs)
+//  mysql.RegisterTLSConfig("custom", &tls.Config{
+//      RootCAs: rootCertPool,
+//      Certificates: clientCert,
+//  })
+//  db, err := sql.Open("mysql", "user@tcp(localhost:3306)/test?tls=custom")
+//
+func RegisterTLSConfig(key string, config *tls.Config) error {
+	if _, isBool := readBool(key); isBool || strings.ToLower(key) == "skip-verify" {
+		return fmt.Errorf("Key '%s' is reserved", key)
+	}
 
-func parseDSN(dsn string) *config {
-	cfg := new(config)
+	tlsConfigRegister[key] = config
+	return nil
+}
+
+// DeregisterTLSConfig removes the tls.Config associated with key.
+func DeregisterTLSConfig(key string) {
+	delete(tlsConfigRegister, key)
+}
+
+func parseDSN(dsn string) (cfg *config, err error) {
+	cfg = new(config)
 	cfg.params = make(map[string]string)
 
 	matches := dsnPattern.FindStringSubmatch(dsn)
@@ -61,7 +103,63 @@ func parseDSN(dsn string) *config {
 				if len(param) != 2 {
 					continue
 				}
-				cfg.params[param[0]] = param[1]
+
+				// cfg params
+				switch value := param[1]; param[0] {
+
+				// Disable INFILE whitelist / enable all files
+				case "allowAllFiles":
+					var isBool bool
+					cfg.allowAllFiles, isBool = readBool(value)
+					if !isBool {
+						err = fmt.Errorf("Invalid Bool value: %s", value)
+						return
+					}
+
+				// Switch "rowsAffected" mode
+				case "clientFoundRows":
+					var isBool bool
+					cfg.clientFoundRows, isBool = readBool(value)
+					if !isBool {
+						err = fmt.Errorf("Invalid Bool value: %s", value)
+						return
+					}
+
+				// Time Location
+				case "loc":
+					cfg.loc, err = time.LoadLocation(value)
+					if err != nil {
+						return
+					}
+
+				// Dial Timeout
+				case "timeout":
+					cfg.timeout, err = time.ParseDuration(value)
+					if err != nil {
+						return
+					}
+
+				// TLS-Encryption
+				case "tls":
+					boolValue, isBool := readBool(value)
+					if isBool {
+						if boolValue {
+							cfg.tls = &tls.Config{}
+						}
+					} else {
+						if strings.ToLower(value) == "skip-verify" {
+							cfg.tls = &tls.Config{InsecureSkipVerify: true}
+						} else if tlsConfig, ok := tlsConfigRegister[value]; ok {
+							cfg.tls = tlsConfig
+						} else {
+							err = fmt.Errorf("Invalid value / unknown config name: %s", value)
+							return
+						}
+					}
+
+				default:
+					cfg.params[param[0]] = value
+				}
 			}
 		}
 	}
@@ -76,7 +174,12 @@ func parseDSN(dsn string) *config {
 		cfg.addr = "127.0.0.1:3306"
 	}
 
-	return cfg
+	// Set default location if not set
+	if cfg.loc == nil {
+		cfg.loc = time.UTC
+	}
+
+	return
 }
 
 // Encrypt password using 4.1+ method
@@ -108,6 +211,194 @@ func scramblePassword(scramble, password []byte) []byte {
 		scramble[i] ^= stage1[i]
 	}
 	return scramble
+}
+
+// Returns the bool value of the input.
+// The 2nd return value indicates if the input was a valid bool value
+func readBool(input string) (value bool, valid bool) {
+	switch input {
+	case "1", "true", "TRUE", "True":
+		return true, true
+	case "0", "false", "FALSE", "False":
+		return false, true
+	}
+
+	// Not a valid bool value
+	return
+}
+
+/******************************************************************************
+*                           Time related utils                                *
+******************************************************************************/
+
+// NullTime represents a time.Time that may be NULL.
+// NullTime implements the Scanner interface so
+// it can be used as a scan destination:
+//
+//  var nt NullTime
+//  err := db.QueryRow("SELECT time FROM foo WHERE id=?", id).Scan(&nt)
+//  ...
+//  if nt.Valid {
+//     // use nt.Time
+//  } else {
+//     // NULL value
+//  }
+//
+// This NullTime implementation is not driver-specific
+type NullTime struct {
+	Time  time.Time
+	Valid bool // Valid is true if Time is not NULL
+}
+
+// Scan implements the Scanner interface.
+// The value type must be time.Time or string / []byte (formatted time-string),
+// otherwise Scan fails.
+func (nt *NullTime) Scan(value interface{}) (err error) {
+	if value == nil {
+		nt.Time, nt.Valid = time.Time{}, false
+		return
+	}
+
+	switch v := value.(type) {
+	case time.Time:
+		nt.Time, nt.Valid = v, true
+		return
+	case []byte:
+		nt.Time, err = parseDateTime(string(v), time.UTC)
+		nt.Valid = (err == nil)
+		return
+	case string:
+		nt.Time, err = parseDateTime(v, time.UTC)
+		nt.Valid = (err == nil)
+		return
+	}
+
+	nt.Valid = false
+	return fmt.Errorf("Can't convert %T to time.Time", value)
+}
+
+// Value implements the driver Valuer interface.
+func (nt NullTime) Value() (driver.Value, error) {
+	if !nt.Valid {
+		return nil, nil
+	}
+	return nt.Time, nil
+}
+
+func parseDateTime(str string, loc *time.Location) (t time.Time, err error) {
+	switch len(str) {
+	case 10: // YYYY-MM-DD
+		if str == "0000-00-00" {
+			return
+		}
+		t, err = time.Parse(timeFormat[:10], str)
+	case 19: // YYYY-MM-DD HH:MM:SS
+		if str == "0000-00-00 00:00:00" {
+			return
+		}
+		t, err = time.Parse(timeFormat, str)
+	default:
+		err = fmt.Errorf("Invalid Time-String: %s", str)
+		return
+	}
+
+	// Adjust location
+	if err == nil && loc != time.UTC {
+		y, mo, d := t.Date()
+		h, mi, s := t.Clock()
+		t, err = time.Date(y, mo, d, h, mi, s, t.Nanosecond(), loc), nil
+	}
+
+	return
+}
+
+func parseBinaryDateTime(num uint64, data []byte, loc *time.Location) (driver.Value, error) {
+	switch num {
+	case 0:
+		return time.Time{}, nil
+	case 4:
+		return time.Date(
+			int(binary.LittleEndian.Uint16(data[:2])), // year
+			time.Month(data[2]),                       // month
+			int(data[3]),                              // day
+			0, 0, 0, 0,
+			loc,
+		), nil
+	case 7:
+		return time.Date(
+			int(binary.LittleEndian.Uint16(data[:2])), // year
+			time.Month(data[2]),                       // month
+			int(data[3]),                              // day
+			int(data[4]),                              // hour
+			int(data[5]),                              // minutes
+			int(data[6]),                              // seconds
+			0,
+			loc,
+		), nil
+	case 11:
+		return time.Date(
+			int(binary.LittleEndian.Uint16(data[:2])), // year
+			time.Month(data[2]),                       // month
+			int(data[3]),                              // day
+			int(data[4]),                              // hour
+			int(data[5]),                              // minutes
+			int(data[6]),                              // seconds
+			int(binary.LittleEndian.Uint32(data[7:11]))*1000, // nanoseconds
+			loc,
+		), nil
+	}
+	return nil, fmt.Errorf("Invalid DATETIME-packet length %d", num)
+}
+
+func formatBinaryDate(num uint64, data []byte) (driver.Value, error) {
+	switch num {
+	case 0:
+		return []byte("0000-00-00"), nil
+	case 4:
+		return []byte(fmt.Sprintf(
+			"%04d-%02d-%02d",
+			binary.LittleEndian.Uint16(data[:2]),
+			data[2],
+			data[3],
+		)), nil
+	}
+	return nil, fmt.Errorf("Invalid DATE-packet length %d", num)
+}
+
+func formatBinaryDateTime(num uint64, data []byte) (driver.Value, error) {
+	switch num {
+	case 0:
+		return []byte("0000-00-00 00:00:00"), nil
+	case 4:
+		return []byte(fmt.Sprintf(
+			"%04d-%02d-%02d 00:00:00",
+			binary.LittleEndian.Uint16(data[:2]),
+			data[2],
+			data[3],
+		)), nil
+	case 7:
+		return []byte(fmt.Sprintf(
+			"%04d-%02d-%02d %02d:%02d:%02d",
+			binary.LittleEndian.Uint16(data[:2]),
+			data[2],
+			data[3],
+			data[4],
+			data[5],
+			data[6],
+		)), nil
+	case 11:
+		return []byte(fmt.Sprintf(
+			"%04d-%02d-%02d %02d:%02d:%02d.%06d",
+			binary.LittleEndian.Uint16(data[:2]),
+			data[2],
+			data[3],
+			data[4],
+			data[5],
+			data[6],
+			binary.LittleEndian.Uint32(data[7:11]),
+		)), nil
+	}
+	return nil, fmt.Errorf("Invalid DATETIME-packet length %d", num)
 }
 
 /******************************************************************************
